@@ -1,0 +1,7 @@
+{
+  "name": "UERI",
+  "description": "Universal Emergency Response Infrastructure prototype with instant SOS broadcast, dynamic radius expansion, live geolocation, nearby responders, and emergency control center.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
