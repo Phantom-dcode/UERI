@@ -76,6 +76,7 @@ import com.example.ui.components.CameraXCaptureDialog
 import com.example.ui.components.EmergencyStatusBadge
 import com.example.ui.components.EvidenceCapturePanel
 import com.example.ui.components.MapComposable
+import com.example.ui.components.OfflineSosCacheBanner
 import com.example.ui.components.TacticalRadarMap
 import com.example.ui.theme.AlertAmber
 import com.example.ui.theme.BrandBlue
@@ -111,6 +112,10 @@ fun CitizenScreen(
     val isRecordingAudio by viewModel.isRecordingAudio.collectAsState()
     val recordingSeconds by viewModel.recordingSeconds.collectAsState()
     val locationState by viewModel.locationState.collectAsState()
+    val isOnline by viewModel.isOnline.collectAsState()
+    val pendingOfflineCount by viewModel.pendingOfflineSosCount.collectAsState()
+    val isSyncingOffline by viewModel.isSyncingOfflineSos.collectAsState()
+    val lastOfflineSyncMessage by viewModel.lastOfflineSyncMessage.collectAsState()
 
     val scrollState = rememberScrollState()
     val context = LocalContext.current
@@ -173,6 +178,19 @@ fun CitizenScreen(
                     )
                 },
                 onRefreshLocation = { viewModel.refreshCurrentLocation() }
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            OfflineSosCacheBanner(
+                isOnline = isOnline,
+                pendingCount = pendingOfflineCount,
+                isSyncing = isSyncingOffline,
+                lastSyncMessage = lastOfflineSyncMessage,
+                onToggleConnectivity = { currentlyOnline ->
+                    viewModel.setOfflineSimulationMode(currentlyOnline)
+                },
+                onForceSyncNow = { viewModel.syncPendingOfflineSosNow() }
             )
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -711,6 +729,39 @@ private fun LocationStatusBanner(
                         fontFamily = FontFamily.Monospace,
                         color = TextSlate600
                     )
+                    if (session.isBeaconActive || session.trackingMode == "NETWORK_ASSISTED" || session.trackingMode == "LAST_KNOWN") {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(6.dp)
+                                    .background(
+                                        when (session.trackingMode) {
+                                            "NETWORK_ASSISTED" -> AlertAmber
+                                            "LAST_KNOWN" -> EmergencyRed
+                                            else -> BrandBlue
+                                        },
+                                        CircleShape
+                                    )
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = when (session.trackingMode) {
+                                    "NETWORK_ASSISTED" -> "EMERGENCY BEACON ACTIVE • NETWORK ASSISTED (BLE)"
+                                    "LAST_KNOWN" -> "EMERGENCY BEACON ACTIVE • LAST KNOWN FIX (BLE)"
+                                    else -> "EMERGENCY BEACON ACTIVE (BLE ROTATING TOKEN)"
+                                },
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Black,
+                                color = when (session.trackingMode) {
+                                    "NETWORK_ASSISTED" -> Color(0xFFB45309)
+                                    "LAST_KNOWN" -> EmergencyRed
+                                    else -> BrandBlue
+                                },
+                                letterSpacing = 0.4.sp
+                            )
+                        }
+                    }
                 }
             }
 
@@ -750,8 +801,16 @@ private fun TelemetryGrid(session: EmergencySession) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             MinimalCard(
                 title = "LOCATION FIX",
-                value = session.locationStatus,
-                valueColor = if (session.locationStatus.contains("GPS") || session.locationStatus == "ACTIVE") BrandBlue else AlertAmber,
+                value = when (session.trackingMode) {
+                    "NETWORK_ASSISTED" -> "NETWORK ASSISTED"
+                    "LAST_KNOWN" -> "LAST KNOWN"
+                    else -> if (session.locationStatus == "ACTIVE" || session.locationStatus == "GPS_VERIFIED") "DIRECT GPS" else session.locationStatus
+                },
+                valueColor = when (session.trackingMode) {
+                    "NETWORK_ASSISTED" -> AlertAmber
+                    "LAST_KNOWN" -> EmergencyRed
+                    else -> SafetyGreenDark
+                },
                 modifier = Modifier.weight(1f),
                 hasDot = true
             )

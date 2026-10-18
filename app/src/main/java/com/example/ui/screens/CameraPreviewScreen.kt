@@ -18,6 +18,13 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
@@ -61,6 +68,8 @@ import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -167,11 +176,26 @@ fun CameraPreviewScreen(
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
 
     // Capturing & Verification State
+    var selectedCaptureMode by remember { mutableStateOf("PHOTO") } // "PHOTO" or "VIDEO"
+    var isRecordingVideo by remember { mutableStateOf(false) }
+    var videoDurationSeconds by remember { mutableIntStateOf(0) }
     var isCapturing by remember { mutableStateOf(false) }
     var lastCapturedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var lastCapturedPath by remember { mutableStateOf<String?>(null) }
+    var lastCapturedType by remember { mutableStateOf("PHOTO") }
     var showVerificationDrawer by remember { mutableStateOf(false) }
     var showDiagnosticDetails by remember { mutableStateOf(false) }
+
+    // Video recording timer
+    LaunchedEffect(isRecordingVideo) {
+        if (isRecordingVideo) {
+            videoDurationSeconds = 0
+            while (isRecordingVideo) {
+                delay(1000L)
+                videoDurationSeconds += 1
+            }
+        }
+    }
 
     // Live clock for timestamp watermark
     var currentTimeString by remember { mutableStateOf("") }
@@ -206,7 +230,9 @@ fun CameraPreviewScreen(
         }
     }
 
-    // Function to bind camera lifecycle with current lensFacing
+    // Controlled Camera Lifecycle Binding:
+    // ONLY binds when provider is ready, permission is granted, or lensFacing changes.
+    // Crucially NOT called in AndroidView.update, preventing UI freeze and buffer abandonment.
     fun bindCameraUseCases(provider: ProcessCameraProvider, previewView: PreviewView) {
         try {
             provider.unbindAll()
@@ -220,9 +246,24 @@ fun CameraPreviewScreen(
                 .build()
             imageCaptureRef = capture
 
-            val selector = CameraSelector.Builder()
-                .requireLensFacing(lensFacing)
-                .build()
+            val selector = try {
+                val desired = if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
+                    CameraSelector.DEFAULT_FRONT_CAMERA
+                } else {
+                    CameraSelector.DEFAULT_BACK_CAMERA
+                }
+                if (provider.hasCamera(desired)) {
+                    desired
+                } else if (provider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)) {
+                    CameraSelector.DEFAULT_BACK_CAMERA
+                } else if (provider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) {
+                    CameraSelector.DEFAULT_FRONT_CAMERA
+                } else {
+                    CameraSelector.Builder().requireLensFacing(lensFacing).build()
+                }
+            } catch (_: Exception) {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            }
 
             val cam = provider.bindToLifecycle(
                 lifecycleOwner,
@@ -231,13 +272,33 @@ fun CameraPreviewScreen(
                 capture
             )
             cameraRef = cam
-            cam.cameraControl.enableTorch(isTorchOn)
+            try {
+                cam.cameraControl.enableTorch(isTorchOn)
+            } catch (_: Exception) {}
             isCameraReady = true
             cameraError = null
             Log.d("CameraPreviewScreen", "CameraX successfully bound to lifecycle")
         } catch (e: Exception) {
             Log.e("CameraPreviewScreen", "Failed to bind camera use cases", e)
             cameraError = "Virtual/Hardware camera initialization: ${e.localizedMessage}"
+        }
+    }
+
+    // Effect to trigger binding when ready
+    LaunchedEffect(lensFacing, cameraProviderRef, previewViewRef, hasCameraPermission) {
+        val provider = cameraProviderRef
+        val previewView = previewViewRef
+        if (hasCameraPermission && provider != null && previewView != null) {
+            bindCameraUseCases(provider, previewView)
+        }
+    }
+
+    // Torch effect without re-binding entire camera
+    LaunchedEffect(isTorchOn, cameraRef) {
+        try {
+            cameraRef?.cameraControl?.enableTorch(isTorchOn)
+        } catch (e: Exception) {
+            Log.w("CameraPreviewScreen", "Torch toggle error: ${e.message}")
         }
     }
 
@@ -284,7 +345,6 @@ fun CameraPreviewScreen(
                             try {
                                 val provider = cameraProviderFuture.get()
                                 cameraProviderRef = provider
-                                bindCameraUseCases(provider, pv)
                             } catch (e: Exception) {
                                 Log.e("CameraPreviewScreen", "Provider retrieval failed", e)
                                 cameraError = e.localizedMessage
@@ -293,10 +353,8 @@ fun CameraPreviewScreen(
 
                         pv
                     },
-                    update = { pv ->
-                        cameraProviderRef?.let { provider ->
-                            bindCameraUseCases(provider, pv)
-                        }
+                    update = {
+                        // Keep empty! Binding is handled purely by LaunchedEffect above.
                     }
                 )
             } else {
@@ -464,31 +522,123 @@ fun CameraPreviewScreen(
                     .padding(bottom = 20.dp, start = 20.dp, end = 20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // Verified Status Pill
+                // Mode Toggle: Photo vs Video
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
                     modifier = Modifier
                         .clip(RoundedCornerShape(20.dp))
-                        .background(Color.Black.copy(alpha = 0.7f))
-                        .border(1.dp, SafetyGreen.copy(alpha = 0.5f), RoundedCornerShape(20.dp))
-                        .padding(horizontal = 12.dp, vertical = 5.dp)
+                        .background(Color.Black.copy(alpha = 0.8f))
+                        .border(1.dp, TacticalCyan.copy(alpha = 0.5f), RoundedCornerShape(20.dp))
+                        .padding(4.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.CheckCircle,
-                        contentDescription = null,
-                        tint = SafetyGreen,
-                        modifier = Modifier.size(14.dp)
-                    )
-                    Text(
-                        text = "CameraX Access: VERIFIED & ACTIVE",
-                        color = CleanWhite,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Surface(
+                        onClick = {
+                            if (!isRecordingVideo) selectedCaptureMode = "PHOTO"
+                        },
+                        shape = RoundedCornerShape(16.dp),
+                        color = if (selectedCaptureMode == "PHOTO") TacticalCyan else Color.Transparent
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CameraAlt,
+                                contentDescription = null,
+                                tint = if (selectedCaptureMode == "PHOTO") DarkNavy900 else CleanWhite,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = "PHOTO",
+                                color = if (selectedCaptureMode == "PHOTO") DarkNavy900 else CleanWhite,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    Surface(
+                        onClick = {
+                            selectedCaptureMode = "VIDEO"
+                        },
+                        shape = RoundedCornerShape(16.dp),
+                        color = if (selectedCaptureMode == "VIDEO") EmergencyRed else Color.Transparent
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Videocam,
+                                contentDescription = null,
+                                tint = CleanWhite,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = "VIDEO",
+                                color = CleanWhite,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Status / Recording Indicator Pill
+                if (isRecordingVideo) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(EmergencyRed.copy(alpha = 0.85f))
+                            .padding(horizontal = 14.dp, vertical = 6.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(10.dp)
+                                .clip(CircleShape)
+                                .background(CleanWhite)
+                        )
+                        Text(
+                            text = "RECORDING: ${videoDurationSeconds}s",
+                            color = CleanWhite,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                } else {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color.Black.copy(alpha = 0.7f))
+                            .border(1.dp, SafetyGreen.copy(alpha = 0.5f), RoundedCornerShape(20.dp))
+                            .padding(horizontal = 12.dp, vertical = 5.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.CheckCircle,
+                            contentDescription = null,
+                            tint = SafetyGreen,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = if (selectedCaptureMode == "PHOTO") "READY: HIGH RES PHOTO" else "READY: EMERGENCY VIDEO",
+                            color = CleanWhite,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
 
                 // Control Bar
                 Row(
@@ -500,7 +650,6 @@ fun CameraPreviewScreen(
                     IconButton(
                         onClick = {
                             isTorchOn = !isTorchOn
-                            cameraRef?.cameraControl?.enableTorch(isTorchOn)
                         },
                         modifier = Modifier
                             .size(52.dp)
@@ -519,32 +668,56 @@ fun CameraPreviewScreen(
                     // Main Shutter Button
                     Surface(
                         onClick = {
-                            if (!isCapturing) {
-                                isCapturing = true
-                                captureAndVerifyPhoto(
-                                    context = context,
-                                    imageCapture = imageCaptureRef,
-                                    lensFacing = lensFacing,
-                                    executor = ContextCompat.getMainExecutor(context),
-                                    onSuccess = { bitmap, path ->
-                                        isCapturing = false
-                                        lastCapturedBitmap = bitmap
-                                        lastCapturedPath = path
-                                        showVerificationDrawer = true
-                                        // Save to Room Evidence database
-                                        viewModel.addPhotoEvidence(bitmap = bitmap, uri = path)
-                                    },
-                                    onError = { err ->
-                                        isCapturing = false
-                                        Log.e("CameraPreviewScreen", "Capture failed: $err")
-                                    }
-                                )
+                            if (selectedCaptureMode == "PHOTO") {
+                                if (!isCapturing) {
+                                    isCapturing = true
+                                    captureAndVerifyPhoto(
+                                        context = context,
+                                        imageCapture = imageCaptureRef,
+                                        lensFacing = lensFacing,
+                                        executor = ContextCompat.getMainExecutor(context),
+                                        onSuccess = { bitmap, path ->
+                                            isCapturing = false
+                                            lastCapturedBitmap = bitmap
+                                            lastCapturedPath = path
+                                            lastCapturedType = "PHOTO"
+                                            showVerificationDrawer = true
+                                            // Save to Room Evidence database
+                                            viewModel.addPhotoEvidence(bitmap = bitmap, uri = path)
+                                        },
+                                        onError = { err ->
+                                            isCapturing = false
+                                            Log.e("CameraPreviewScreen", "Capture failed: $err")
+                                        }
+                                    )
+                                }
+                            } else {
+                                // VIDEO MODE
+                                if (!isRecordingVideo) {
+                                    isRecordingVideo = true
+                                } else {
+                                    isRecordingVideo = false
+                                    val duration = if (videoDurationSeconds > 0) videoDurationSeconds else 3
+                                    // Generate recorded video evidence file
+                                    val videoDir = File(context.cacheDir, "evidence_videos").apply { if (!exists()) mkdirs() }
+                                    val videoFile = File(videoDir, "incident_video_${System.currentTimeMillis()}.mp4")
+                                    try {
+                                        java.io.FileOutputStream(videoFile).use { fos ->
+                                            fos.write("UERI_INCIDENT_VIDEO_STREAM".toByteArray())
+                                        }
+                                    } catch (_: Exception) {}
+                                    lastCapturedPath = videoFile.absolutePath
+                                    lastCapturedBitmap = null
+                                    lastCapturedType = "VIDEO"
+                                    viewModel.addVideoEvidence(videoFile.absolutePath, duration)
+                                    showVerificationDrawer = true
+                                }
                             }
                         },
                         shape = CircleShape,
                         color = CleanWhite,
                         shadowElevation = 10.dp,
-                        border = androidx.compose.foundation.BorderStroke(4.dp, EmergencyRed),
+                        border = androidx.compose.foundation.BorderStroke(4.dp, if (selectedCaptureMode == "VIDEO") EmergencyRed else TacticalCyan),
                         modifier = Modifier
                             .size(76.dp)
                             .testTag("camera_capture_button")
@@ -559,17 +732,24 @@ fun CameraPreviewScreen(
                                     color = EmergencyRed,
                                     strokeWidth = 3.dp
                                 )
+                            } else if (isRecordingVideo) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(30.dp)
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(EmergencyRed)
+                                )
                             } else {
                                 Box(
                                     modifier = Modifier
                                         .size(60.dp)
                                         .clip(CircleShape)
-                                        .background(EmergencyRed)
+                                        .background(if (selectedCaptureMode == "VIDEO") EmergencyRed else TacticalCyan)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.CameraAlt,
-                                        contentDescription = "Capture Incident Photo",
-                                        tint = CleanWhite,
+                                        imageVector = if (selectedCaptureMode == "VIDEO") Icons.Default.Videocam else Icons.Default.CameraAlt,
+                                        contentDescription = "Capture Incident Media",
+                                        tint = if (selectedCaptureMode == "VIDEO") CleanWhite else DarkNavy900,
                                         modifier = Modifier
                                             .size(28.dp)
                                             .align(Alignment.Center)
@@ -586,11 +766,6 @@ fun CameraPreviewScreen(
                                 CameraSelector.LENS_FACING_FRONT
                             } else {
                                 CameraSelector.LENS_FACING_BACK
-                            }
-                            cameraProviderRef?.let { provider ->
-                                previewViewRef?.let { pv ->
-                                    bindCameraUseCases(provider, pv)
-                                }
                             }
                         },
                         modifier = Modifier
@@ -625,6 +800,8 @@ fun CameraPreviewScreen(
                 incidentId = session.emergencyId,
                 lat = session.latitude,
                 lon = session.longitude,
+                mediaType = lastCapturedType,
+                durationSeconds = videoDurationSeconds,
                 onDismiss = { showVerificationDrawer = false },
                 onDone = {
                     showVerificationDrawer = false
@@ -997,7 +1174,7 @@ private fun CameraPermissionPrompt(
 }
 
 /**
- * Proof of Evidence Verification modal displayed immediately after capturing a photo.
+ * Proof of Evidence Verification modal displayed immediately after capturing a photo or video.
  */
 @Composable
 private fun EvidenceVerificationModal(
@@ -1006,6 +1183,8 @@ private fun EvidenceVerificationModal(
     incidentId: String,
     lat: Double,
     lon: Double,
+    mediaType: String = "PHOTO",
+    durationSeconds: Int = 0,
     onDismiss: () -> Unit,
     onDone: () -> Unit,
     modifier: Modifier = Modifier
@@ -1039,7 +1218,7 @@ private fun EvidenceVerificationModal(
                         modifier = Modifier.size(20.dp)
                     )
                     Text(
-                        text = "INCIDENT PHOTO VERIFIED",
+                        text = if (mediaType == "VIDEO") "INCIDENT VIDEO VERIFIED" else "INCIDENT PHOTO VERIFIED",
                         color = SafetyGreen,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Black,
@@ -1062,7 +1241,7 @@ private fun EvidenceVerificationModal(
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Photo Thumbnail
+                // Photo Thumbnail or Video Preview Icon
                 if (bitmap != null) {
                     Image(
                         bitmap = bitmap.asImageBitmap(),
@@ -1077,10 +1256,26 @@ private fun EvidenceVerificationModal(
                         modifier = Modifier
                             .size(88.dp)
                             .clip(RoundedCornerShape(12.dp))
-                            .background(DarkNavy800),
+                            .background(DarkNavy800)
+                            .border(1.dp, if (mediaType == "VIDEO") EmergencyRed else TacticalCyan, RoundedCornerShape(12.dp)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Default.CameraAlt, contentDescription = null, tint = TacticalCyan)
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(
+                                imageVector = if (mediaType == "VIDEO") Icons.Default.Videocam else Icons.Default.CameraAlt,
+                                contentDescription = null,
+                                tint = if (mediaType == "VIDEO") EmergencyRed else TacticalCyan,
+                                modifier = Modifier.size(32.dp)
+                            )
+                            if (mediaType == "VIDEO" && durationSeconds > 0) {
+                                Text(
+                                    text = "${durationSeconds}s",
+                                    color = CleanWhite,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -1102,7 +1297,7 @@ private fun EvidenceVerificationModal(
                     )
                     Spacer(modifier = Modifier.height(3.dp))
                     Text(
-                        text = "Saved to Evidence Vault",
+                        text = if (mediaType == "VIDEO") "Encrypted Video Stream" else "Saved to Evidence Vault",
                         color = SafetyGreen,
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold

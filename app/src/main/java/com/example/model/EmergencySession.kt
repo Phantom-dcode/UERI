@@ -23,5 +23,8 @@ data class EmergencySession(
     val activeResponderName: String? = null,
     val activeResponderDistanceMeters: Double? = null,
     val activeResponderEtaMinutes: Int? = null,
-    val resolutionDurationSeconds: Long? = null
+    val resolutionDurationSeconds: Long? = null,
+    val acceptedResponderUid: String? = null,
+    val trackingMode: String = "DIRECT_GPS",
+    val isBeaconActive: Boolean = false
 )

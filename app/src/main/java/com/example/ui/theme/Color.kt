@@ -20,6 +20,7 @@ val AlertAmberLight = Color(0xFFFEF3C7)
 val AlertAmberContainer = Color(0xFFFFFBEB)
 
 val BrandBlue = Color(0xFF2563EB)
+val BrandBlueDark = Color(0xFF1D4ED8)
 val BrandBlueLight = Color(0xFFEFF6FF)
 val TacticalCyan = Color(0xFF0891B2)
 

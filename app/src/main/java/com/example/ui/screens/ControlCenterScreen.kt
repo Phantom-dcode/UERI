@@ -52,6 +52,7 @@ import com.example.model.Responder
 import com.example.model.ResponderStatus
 import com.example.ui.components.EmergencyStatusBadge
 import com.example.ui.components.MapComposable
+import com.example.ui.components.SosAnalyticsDashboardCard
 import com.example.ui.components.TacticalRadarMap
 import com.example.ui.theme.AlertAmber
 import com.example.ui.theme.BrandBlue
@@ -80,6 +81,7 @@ fun ControlCenterScreen(
     val session by viewModel.session.collectAsState()
     val responders by viewModel.responders.collectAsState()
     val logs by viewModel.logs.collectAsState()
+    val analytics24h by viewModel.sosAnalytics24h.collectAsState()
 
     val scrollState = rememberScrollState()
 
@@ -269,6 +271,15 @@ fun ControlCenterScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
+            // 24-Hour SOS Call Frequency & Geographic Distribution Visualization
+            SosAnalyticsDashboardCard(
+                analytics = analytics24h,
+                centerLat = session.latitude,
+                centerLon = session.longitude
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
             // Tactical Map
             Card(
                 modifier = Modifier
@@ -290,13 +301,31 @@ fun ControlCenterScreen(
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
                         )
-                        Text(
-                            text = "LIVE FEED",
-                            color = SafetyGreen,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Black,
-                            fontFamily = FontFamily.Monospace
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (session.isBeaconActive || session.trackingMode == "NETWORK_ASSISTED" || session.trackingMode == "LAST_KNOWN") {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(if (session.trackingMode == "NETWORK_ASSISTED") AlertAmber.copy(alpha = 0.15f) else BrandBlue.copy(alpha = 0.15f))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = if (session.trackingMode == "NETWORK_ASSISTED") "BLE BEACON • NETWORK ASSISTED" else "EMERGENCY BEACON ACTIVE",
+                                        color = if (session.trackingMode == "NETWORK_ASSISTED") Color(0xFFB45309) else BrandBlue,
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Black
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(6.dp))
+                            }
+                            Text(
+                                text = "LIVE FEED",
+                                color = SafetyGreen,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Black,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))

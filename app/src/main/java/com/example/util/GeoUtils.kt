@@ -73,6 +73,10 @@ object GeoUtils {
         val (latC, lonC) = offsetCoordinate(victimLat, victimLon, 1600.0, 260.0)
         val (latD, lonD) = offsetCoordinate(victimLat, victimLon, 3200.0, 330.0)
         val (latE, lonE) = offsetCoordinate(victimLat, victimLon, 4700.0, 90.0)
+        val (latF, lonF) = offsetCoordinate(victimLat, victimLon, 6800.0, 210.0)
+        val (latG, lonG) = offsetCoordinate(victimLat, victimLon, 9500.0, 315.0)
+        val (latH, lonH) = offsetCoordinate(victimLat, victimLon, 14000.0, 120.0)
+        val (latI, lonI) = offsetCoordinate(victimLat, victimLon, 22000.0, 15.0)
 
         return listOf(
             Responder(
@@ -124,6 +128,46 @@ object GeoUtils {
                 status = ResponderStatus.AVAILABLE,
                 distanceMeters = 4700.0,
                 etaMinutes = 15
+            ),
+            Responder(
+                id = "resp-6",
+                name = "Capt. M. Ross",
+                role = "County Sheriff",
+                latitude = latF,
+                longitude = lonF,
+                status = ResponderStatus.AVAILABLE,
+                distanceMeters = 6800.0,
+                etaMinutes = 18
+            ),
+            Responder(
+                id = "resp-7",
+                name = "Air Medevac 3",
+                role = "Helicopter EMS",
+                latitude = latG,
+                longitude = lonG,
+                status = ResponderStatus.AVAILABLE,
+                distanceMeters = 9500.0,
+                etaMinutes = 14
+            ),
+            Responder(
+                id = "resp-8",
+                name = "Heavy Rescue 9",
+                role = "Regional Disaster Team",
+                latitude = latH,
+                longitude = lonH,
+                status = ResponderStatus.AVAILABLE,
+                distanceMeters = 14000.0,
+                etaMinutes = 25
+            ),
+            Responder(
+                id = "resp-9",
+                name = "State Task Force 1",
+                role = "Mutual Aid Strike Team",
+                latitude = latI,
+                longitude = lonI,
+                status = ResponderStatus.AVAILABLE,
+                distanceMeters = 22000.0,
+                etaMinutes = 35
             )
         )
     }

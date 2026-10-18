@@ -4,15 +4,17 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import com.example.model.CachedSosRequest
 import com.example.model.EmergencySession
 
 @Database(
-    entities = [EmergencySession::class],
-    version = 1,
+    entities = [EmergencySession::class, CachedSosRequest::class],
+    version = 4,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun emergencyDao(): EmergencyDao
+    abstract fun offlineSosDao(): OfflineSosDao
 
     companion object {
         @Volatile

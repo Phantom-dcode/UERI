@@ -244,6 +244,27 @@ fun DemoScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
+                    // Simulate BLE Beacon Relay (Network-Assisted Proximity)
+                    OutlinedButton(
+                        onClick = { viewModel.simulateBeaconRelay() },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("demo_simulate_beacon_relay"),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = CleanWhite,
+                            contentColor = BrandBlue
+                        ),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, BrandBlue),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(Icons.Default.Speed, contentDescription = null, modifier = Modifier.size(18.dp), tint = BrandBlue)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("2B. SIMULATE BLE BEACON RELAY (NETWORK-ASSISTED)", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
                     // Responder Response
                     Button(
                         onClick = { viewModel.responderRespond("resp-1") },
@@ -355,6 +376,10 @@ fun DemoScreen(
                     TechFeatureItem(
                         title = "4. Cryptographic Audit Chain",
                         desc = "All incident alerts, evidence timestamps, and responder acceptances are stored locally in Room DB with millisecond audit trails."
+                    )
+                    TechFeatureItem(
+                        title = "5. BLE Emergency Beacon Prototype (OEM Integration Required)",
+                        desc = "When direct GPS is unavailable (LAST_KNOWN), advertises rotating tokens (zero PII/exact coordinates). Nearby responders relay RSSI proximity to backend (NETWORK_ASSISTED). Platform-compliant prototype; continuous background scanning requires OEM / System OS integration."
                     )
                 }
             }

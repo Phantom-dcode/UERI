@@ -78,7 +78,7 @@ fun ResponderScreen(
     viewModel: EmergencyViewModel,
     modifier: Modifier = Modifier
 ) {
-    val session by viewModel.session.collectAsState()
+    val session by viewModel.responderSession.collectAsState()
     val responders by viewModel.responders.collectAsState()
     val selectedId by viewModel.selectedResponderId.collectAsState()
     val currentResponder = responders.find { it.id == selectedId } ?: responders.firstOrNull()
@@ -192,8 +192,9 @@ fun ResponderScreen(
                             fontWeight = FontWeight.Bold
                         )
                         currentResponder?.let {
+                            val dist = session.activeResponderDistanceMeters ?: it.distanceMeters
                             Text(
-                                text = "DISTANCE: ${EmergencyConfig.formatDistance(it.distanceMeters)}",
+                                text = "DISTANCE: ${EmergencyConfig.formatDistance(dist)}",
                                 color = BrandBlue,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
@@ -227,13 +228,41 @@ fun ResponderScreen(
                 border = androidx.compose.foundation.BorderStroke(1.dp, SlateBorderLight)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text(
-                        text = "INCIDENT BRIEFING",
-                        color = TextSlate900,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 0.5.sp
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "INCIDENT BRIEFING",
+                            color = TextSlate900,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.5.sp
+                        )
+                        if (session.isBeaconActive || session.trackingMode == "NETWORK_ASSISTED" || session.trackingMode == "LAST_KNOWN") {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (session.trackingMode == "NETWORK_ASSISTED") AlertAmber.copy(alpha = 0.15f) else BrandBlue.copy(alpha = 0.15f))
+                                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .background(if (session.trackingMode == "NETWORK_ASSISTED") AlertAmber else BrandBlue, CircleShape)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = if (session.trackingMode == "NETWORK_ASSISTED") "BEACON ACTIVE • BLE ASSISTED" else "EMERGENCY BEACON ACTIVE",
+                                    color = if (session.trackingMode == "NETWORK_ASSISTED") Color(0xFFB45309) else BrandBlue,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Black
+                                )
+                            }
+                        }
+                    }
 
                     Spacer(modifier = Modifier.height(10.dp))
 
@@ -269,9 +298,29 @@ fun ResponderScreen(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                BriefItem("Est. Travel Time", "${currentResponder?.etaMinutes ?: 2} MIN", TextSlate900)
-                                BriefItem("Direct Distance", EmergencyConfig.formatDistance(currentResponder?.distanceMeters ?: 400.0), TextSlate900)
+                                BriefItem("Est. Travel Time", "${session.activeResponderEtaMinutes ?: currentResponder?.etaMinutes ?: 2} MIN", TextSlate900)
+                                BriefItem("Direct Distance", EmergencyConfig.formatDistance(session.activeResponderDistanceMeters ?: currentResponder?.distanceMeters ?: 400.0), TextSlate900)
                                 BriefItem("Location Status", session.locationStatus, SafetyGreen)
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                BriefItem("Responders Nearby", "${session.respondersCount} ACTIVE", BrandBlue)
+                                BriefItem("Incident Location", "${String.format(java.util.Locale.US, "%.4f", session.latitude)}, ${String.format(java.util.Locale.US, "%.4f", session.longitude)}", TextSlate900)
+                                BriefItem(
+                                    "GPS Status",
+                                    when (session.trackingMode) {
+                                        "NETWORK_ASSISTED" -> "NETWORK ASSISTED"
+                                        "LAST_KNOWN" -> "LAST KNOWN"
+                                        else -> if (session.locationStatus == "ACTIVE" || session.locationStatus == "GPS_VERIFIED") "DIRECT GPS" else session.locationStatus
+                                    },
+                                    when (session.trackingMode) {
+                                        "NETWORK_ASSISTED" -> AlertAmber
+                                        "LAST_KNOWN" -> EmergencyRed
+                                        else -> SafetyGreen
+                                    }
+                                )
                             }
                         }
                     }

@@ -1,0 +1,134 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for Role-Based Access Control (RBAC)
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function getUserRole() {
+      return isAuthenticated() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? getUserData().role
+        : 'CITIZEN';
+    }
+
+    function isRole(role) {
+      return isAuthenticated() && getUserRole() == role;
+    }
+
+    function isCitizen() {
+      return isAuthenticated() && (getUserRole() == 'CITIZEN' || request.auth.token.role == 'CITIZEN');
+    }
+
+    function isResponder() {
+      return isAuthenticated() && (getUserRole() == 'RESPONDER' || request.auth.token.role == 'RESPONDER');
+    }
+
+    function isControlOperator() {
+      return isAuthenticated() && (getUserRole() == 'CONTROL_OPERATOR' || request.auth.token.role == 'CONTROL_OPERATOR');
+    }
+
+    function isAuditor() {
+      return isAuthenticated() && (getUserRole() == 'AUDITOR' || request.auth.token.role == 'AUDITOR');
+    }
+
+    // 1. User Profiles: users/{userId}
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isControlOperator() || isAuditor());
+      allow create, update: if isAuthenticated() && (request.auth.uid == userId || isControlOperator());
+      allow delete: if isControlOperator();
+    }
+
+    // 2. Tactical Responders: responders/{responderId}
+    match /responders/{responderId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated();
+      allow delete: if isControlOperator();
+    }
+
+    // 3. Emergency Incidents: emergencies/{emergencyId}
+    match /emergencies/{emergencyId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && (isCitizen() || isControlOperator());
+      allow update: if isAuthenticated() && (
+        (isCitizen() && resource.data.victimUid == request.auth.uid) ||
+        isResponder() ||
+        isControlOperator()
+      );
+      allow delete: if isControlOperator();
+
+      // 4. Incident Chronological Events: emergencies/{emergencyId}/events/{eventId}
+      match /events/{eventId} {
+        allow read: if isAuthenticated();
+        allow create: if isAuthenticated();
+        allow update, delete: if isControlOperator();
+      }
+    }
+
+    // 5. Emergency Responses: emergencyResponses/{responseId}
+    match /emergencyResponses/{responseId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated() && (isResponder() || isControlOperator());
+      allow delete: if isControlOperator();
+    }
+
+    // 6. Beacon Tokens: beaconTokens/{tokenId}
+    match /beaconTokens/{tokenId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update: if isAuthenticated() && (isControlOperator() || isCitizen());
+      allow delete: if isControlOperator();
+    }
+
+    // 7. Beacon Detections: beaconDetections/{detectionId}
+    match /beaconDetections/{detectionId} {
+      allow read: if isAuthenticated() && (isControlOperator() || isResponder() || isAuditor());
+      allow create: if isAuthenticated();
+      allow update, delete: if isControlOperator();
+    }
+
+    // 8. Evidence Metadata: evidence/{evidenceId}
+    match /evidence/{evidenceId} {
+      allow read: if isAuthenticated() && (
+        resource.data.victimUid == request.auth.uid ||
+        isResponder() ||
+        isControlOperator() ||
+        isAuditor()
+      );
+      allow create: if isAuthenticated();
+      allow update: if isAuthenticated() && (
+        resource.data.victimUid == request.auth.uid ||
+        isControlOperator()
+      );
+      allow delete: if isControlOperator();
+    }
+
+    // 9. Audit Logs: auditLogs/{logId} (Strictly append-only)
+    match /auditLogs/{logId} {
+      allow read: if isAuthenticated() && (isControlOperator() || isAuditor());
+      allow create: if isAuthenticated();
+      allow update, delete: if false; // Append-only immutable trail
+    }
+
+    match /audit_logs/{logId} {
+      allow read: if isAuthenticated() && (isControlOperator() || isAuditor());
+      allow create: if isAuthenticated();
+      allow update, delete: if false;
+    }
+
+    // 10. System Metadata / Counters: metadata/{docId}
+    match /metadata/{docId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // 11. OTP Verifications: otpVerifications/{targetHash}
+    match /otpVerifications/{targetHash} {
+      allow read, write: if false; // Zero client read/write access: managed exclusively via secure backend
+    }
+  }
+}

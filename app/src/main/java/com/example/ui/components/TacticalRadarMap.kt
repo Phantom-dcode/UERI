@@ -132,7 +132,8 @@ fun TacticalRadarMap(
                 .pointerInput(responders, zoomLevel) {
                     detectTapGestures { tapOffset ->
                         val center = Offset(size.width / 2f, size.height / 2f)
-                        val maxDisplayRadiusMeters = 4000.0 / zoomLevel
+                        val baseRadius = maxOf(4000.0, animatedRadiusMeters.toDouble() * 1.25)
+                        val maxDisplayRadiusMeters = baseRadius / zoomLevel
                         val minDim = minOf(size.width, size.height).toFloat()
                         val pixelsPerMeter = (minDim * 0.45f) / maxDisplayRadiusMeters.toFloat()
 
@@ -155,7 +156,8 @@ fun TacticalRadarMap(
                 }
         ) {
             val center = Offset(size.width / 2f, size.height / 2f)
-            val maxDisplayRadiusMeters = 4000.0 / zoomLevel
+            val baseRadius = maxOf(4000.0, animatedRadiusMeters.toDouble() * 1.25)
+            val maxDisplayRadiusMeters = baseRadius / zoomLevel
             val pixelsPerMeter = (size.minDimension * 0.45f) / maxDisplayRadiusMeters.toFloat()
 
             // 1. Draw Base Cartography (Water, Parks, Urban blocks)
