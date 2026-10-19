@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.example.util.EmailValidationResult
 import com.example.util.EmailValidator
+import com.google.firebase.functions.FirebaseFunctionsException
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -17,7 +18,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [35])
 class EmailVerificationDataDrivenTest {
 
     private lateinit var context: Context
@@ -32,6 +33,9 @@ class EmailVerificationDataDrivenTest {
         authManager.logout()
         otpManager = authManager.otpManager
         otpManager.clearAllForTest()
+        OtpVerificationManager.setEmailDeliveryProviderForTest(object : EmailDeliveryProvider {
+            override fun deliver(email: String, code: String): Result<Unit> = Result.success(Unit)
+        })
     }
 
     // =========================================================================
@@ -238,6 +242,27 @@ class EmailVerificationDataDrivenTest {
     // =========================================================================
 
     @Test
+    fun `test missing callable endpoint - provides deployment guidance`() {
+        val mapped = otpManager.mapEmailFunctionError(
+            FirebaseFunctionsException.Code.NOT_FOUND,
+            "NOT_FOUND"
+        )
+
+        assertTrue(mapped.message.orEmpty().contains("not deployed"))
+        assertTrue(mapped.message.orEmpty().contains("us-central1"))
+    }
+
+    @Test
+    fun `test missing backend configuration - preserves actionable message`() {
+        val mapped = otpManager.mapEmailFunctionError(
+            FirebaseFunctionsException.Code.FAILED_PRECONDITION,
+            "Cloud Firestore is not initialized for this Firebase project."
+        )
+
+        assertTrue(mapped.message.orEmpty().contains("Cloud Firestore is not initialized"))
+    }
+
+    @Test
     fun `test provider failure - returns truthful error without creating verified challenge`() = runBlocking {
         // Configure test provider to simulate SMTP provider failure (e.g. quota limit, connection timeout)
         OtpVerificationManager.setEmailDeliveryProviderForTest(object : EmailDeliveryProvider {
@@ -250,6 +275,7 @@ class EmailVerificationDataDrivenTest {
         val dispatchResult = authManager.sendRegistrationOtp(target, OtpChannel.EMAIL, "Victim User")
 
         assertTrue("Provider failure must not report success", dispatchResult.isFailure)
+        assertEquals(OtpFlowState.SEND_FAILED, otpManager.state(target, OtpPurpose.REGISTRATION))
         assertTrue(dispatchResult.exceptionOrNull()?.message?.contains("quota exceeded") == true ||
                    dispatchResult.exceptionOrNull()?.message?.contains("unavailable") == true)
 
@@ -263,6 +289,7 @@ class EmailVerificationDataDrivenTest {
         val target = "user_${System.currentTimeMillis()}@ueri.org"
         val dispatch = authManager.sendRegistrationOtp(target, OtpChannel.EMAIL, "Test User")
         assertTrue(dispatch.isSuccess)
+        assertEquals(OtpFlowState.OTP_REQUEST_ACCEPTED, otpManager.state(target, OtpPurpose.REGISTRATION))
 
         // Attempt verification with wrong code
         val verifyFail1 = authManager.verifyRegistrationOtp(target, "000000")

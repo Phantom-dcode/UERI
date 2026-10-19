@@ -3,21 +3,41 @@ package com.example
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.example.auth.AuthState
+import com.example.auth.EmailDeliveryProvider
 import com.example.auth.FirebaseAuthManager
+import com.example.auth.OtpVerificationManager
+import com.example.auth.OtpFlowState
 import com.example.model.ueri.UserRole
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.After
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [35])
 class ExampleRobolectricTest {
+
+    @Before
+    fun configureEmailOtpProvider() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        OtpVerificationManager.getInstance(context).clearAllForTest()
+        OtpVerificationManager.setEmailDeliveryProviderForTest(object : EmailDeliveryProvider {
+            override fun deliver(email: String, code: String): Result<Unit> = Result.success(Unit)
+        })
+    }
+
+    @After
+    fun clearEmailOtpProvider() {
+        OtpVerificationManager.getInstance().clearAllForTest()
+    }
 
     @Test
     fun `read string from context`() {
@@ -26,9 +46,8 @@ class ExampleRobolectricTest {
         assertEquals("UERI", appName)
     }
 
-    private fun verifyTarget(auth: FirebaseAuthManager, target: String) {
-        val channel = if (target.contains("@")) com.example.auth.OtpChannel.EMAIL else com.example.auth.OtpChannel.SMS
-        auth.sendRegistrationOtp(target, channel, "Test User")
+    private suspend fun verifyTarget(auth: FirebaseAuthManager, target: String) {
+        auth.sendRegistrationOtp(target, com.example.auth.OtpChannel.EMAIL, "Test User")
         val code = auth.otpManager.getPendingCodeForTest(target, com.example.auth.OtpPurpose.REGISTRATION)!!
         auth.verifyRegistrationOtp(target, code)
     }
@@ -449,6 +468,8 @@ class ExampleRobolectricTest {
         assertTrue("User must be preserved in durable persistent storage", userRecord != null)
         assertEquals(email, userRecord?.second?.email)
         assertEquals("Persistent Citizen", userRecord?.second?.displayName)
+        assertTrue(userRecord?.second?.emailVerified == true)
+        assertFalse(userRecord?.second?.phoneVerified == true)
 
         // 4. Sign in with the registered credentials on the restarted instance
         val loginRes = restartedAuthManager.login(email, password)
@@ -460,59 +481,34 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `otp registration flow generates valid codes and gates password creation`() = runBlocking {
+    fun `unconfigured phone otp channels fail without creating a local code`() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val authManager = FirebaseAuthManager(context)
         authManager.logout()
 
-        val email = "otp_citizen_${System.currentTimeMillis()}@ueri.org"
-
-        // Step 1: Send OTP via WhatsApp
+        // No SMS or WhatsApp provider is configured in this project.
         val dispatch = authManager.sendRegistrationOtp(
             targetDestination = "+919876543210",
             channel = com.example.auth.OtpChannel.WHATSAPP,
             displayName = "WhatsApp Citizen"
-        ).getOrThrow()
-        val otpCode = authManager.otpManager.getPendingCodeForTest("+919876543210", com.example.auth.OtpPurpose.REGISTRATION)!!
-        assertEquals(6, otpCode.length)
-        assertTrue(dispatch.deliveryMessage.contains("phone number"))
-
-        // Step 2: Attempting to register BEFORE verifying OTP should be rejected
-        val prematureReg = authManager.registerCitizen(
-            name = "WhatsApp Citizen",
-            countryIsoCode = "IN",
-            countryCallingCode = "+91",
-            nationalPhoneNumber = "9876543210",
-            email = email,
-            pass = "secret123",
-            otpVerifiedTarget = "+919876543210"
         )
-        assertTrue(prematureReg.isFailure)
-
-        // Step 3: Enter invalid code should fail
-        val invalidVerify = authManager.verifyRegistrationOtp("+919876543210", "000000")
-        assertTrue(invalidVerify.isFailure)
-
-        // Step 4: Enter valid code should succeed
-        val validVerify = authManager.verifyRegistrationOtp("+919876543210", otpCode)
-        assertTrue(validVerify.isSuccess)
-
-        // Step 5: Now register with the verified target -> SUCCEEDS
-        val validReg = authManager.registerCitizen(
-            name = "WhatsApp Citizen",
-            countryIsoCode = "IN",
-            countryCallingCode = "+91",
-            nationalPhoneNumber = "9876543210",
-            email = email,
-            pass = "secret123",
-            otpVerifiedTarget = "+919876543210"
+        assertTrue(dispatch.isFailure)
+        assertTrue(dispatch.exceptionOrNull()?.message?.contains("not configured") == true)
+        assertNull(authManager.otpManager.getPendingCodeForTest("+919876543210", com.example.auth.OtpPurpose.REGISTRATION))
+        assertFalse(authManager.otpManager.isVerified("+919876543210", com.example.auth.OtpPurpose.REGISTRATION))
+        assertEquals(
+            OtpFlowState.SEND_FAILED,
+            authManager.otpManager.state("+919876543210", com.example.auth.OtpPurpose.REGISTRATION)
         )
-        assertTrue(validReg.isSuccess)
-        assertEquals("WhatsApp Citizen", validReg.getOrThrow().displayName)
+        assertTrue(authManager.sendRegistrationOtp(
+            targetDestination = "+919876543210",
+            channel = com.example.auth.OtpChannel.SMS,
+            displayName = "WhatsApp Citizen"
+        ).isFailure)
     }
 
     @Test
-    fun `forgot password with otp flow supports multi-channel reset and new password signin`() = runBlocking {
+    fun `forgot password email otp flow resets password and allows new signin`() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val authManager = FirebaseAuthManager(context)
         authManager.logout()
@@ -540,17 +536,17 @@ class ExampleRobolectricTest {
         assertTrue(regRes.isSuccess)
         authManager.logout()
 
-        // 3. Request Forgot Password OTP via SMS
-        val smsDispatch = authManager.requestForgotPasswordOtp(email, com.example.auth.OtpChannel.SMS)
-        assertTrue(smsDispatch.isSuccess)
-        val smsCode = authManager.otpManager.getPendingCodeForTest(email, com.example.auth.OtpPurpose.FORGOT_PASSWORD)!!
+        // 3. Request Forgot Password OTP through the test email provider.
+        val emailDispatch = authManager.requestForgotPasswordOtp(email, com.example.auth.OtpChannel.EMAIL)
+        assertTrue(emailDispatch.isSuccess)
+        val emailCode = authManager.otpManager.getPendingCodeForTest(email, com.example.auth.OtpPurpose.FORGOT_PASSWORD)!!
 
         // 4. Verify OTP code
-        val verifyRes = authManager.verifyForgotPasswordOtp(email, smsCode)
+        val verifyRes = authManager.verifyForgotPasswordOtp(email, emailCode)
         assertTrue(verifyRes.isSuccess)
 
         // 5. Reset password with valid code
-        val resetRes = authManager.resetPasswordWithOtp(email, smsCode, newPass)
+        val resetRes = authManager.resetPasswordWithOtp(email, emailCode, newPass)
         assertTrue(resetRes.isSuccess)
 
         // 6. Old password no longer works
@@ -579,7 +575,7 @@ class ExampleRobolectricTest {
         assertTrue("Case A must reject malformed email", caseARes.isFailure)
         assertEquals("Please enter a valid email address.", caseARes.exceptionOrNull()?.message)
 
-        // Case B & C: Enter a validly formatted email -> backend attempts real delivery; OTP is not exposed in API response
+        // Case B & C: The test-only provider accepts a valid email; no real delivery is attempted.
         val testEmail = "citizen_${System.currentTimeMillis()}@example.com"
         val caseBRes = authManager.sendRegistrationOtp(
             targetDestination = testEmail,
@@ -590,7 +586,7 @@ class ExampleRobolectricTest {
         val dispatch = caseBRes.getOrThrow()
         assertEquals(testEmail, dispatch.formattedTarget)
         // Case C: Neutral delivery message only; no plaintext OTP exposed in response
-        assertEquals("If this email can receive verification, a verification code has been sent.", dispatch.deliveryMessage)
+        assertEquals("The email provider accepted the verification request. Delivery to your inbox is not confirmed.", dispatch.deliveryMessage)
         assertEquals(com.example.auth.OtpChannel.EMAIL, dispatch.channel)
 
         // Case H: Resend too frequently (< 60s) -> rate-limited
@@ -607,7 +603,7 @@ class ExampleRobolectricTest {
         assertTrue("Case E must reject incorrect OTP", caseERes.isFailure)
         assertEquals("Invalid or expired verification code. Please try again.", caseERes.exceptionOrNull()?.message)
 
-        // Case D & G: Enter the correct OTP received from real inbox -> verified
+        // Case D & G: Verify the code captured by the test-only provider.
         val testCode = authManager.otpManager.getPendingCodeForTest(testEmail, com.example.auth.OtpPurpose.REGISTRATION)
         assertNotNull("Cryptographic code must be generated", testCode)
         assertEquals(6, testCode!!.length)
@@ -627,7 +623,8 @@ class ExampleRobolectricTest {
             otpVerifiedTarget = testEmail
         ).getOrThrow()
         assertEquals("Valid Citizen", citizenAccount.displayName)
-        assertTrue(citizenAccount.phoneVerified)
+        assertTrue(citizenAccount.emailVerified)
+        assertFalse(citizenAccount.phoneVerified)
 
         // Single-use consumption check: attempting to reuse verification fails
         assertFalse(authManager.otpManager.isVerified(testEmail, com.example.auth.OtpPurpose.REGISTRATION))
