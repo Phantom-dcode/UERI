@@ -1,5 +1,6 @@
 package com.example.auth
 
+import android.app.Activity
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
@@ -10,6 +11,8 @@ import com.example.model.ueri.UserAccount
 import com.example.model.ueri.UserRole
 import com.example.util.PhoneNumberValidator
 import com.example.util.PhoneValidationResult
+import com.example.util.EmailValidator
+import com.example.util.EmailValidationResult
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
 import com.google.firebase.auth.FirebaseAuthInvalidUserException
@@ -749,23 +752,25 @@ class FirebaseAuthManager(
     /**
      * Step 1 for Registration: Request OTP verification code before password creation.
      */
-    fun sendRegistrationOtp(
+    suspend fun sendRegistrationOtp(
         targetDestination: String,
         channel: OtpChannel,
-        displayName: String
+        displayName: String,
+        activity: Activity? = null
     ): Result<OtpDispatchResult> {
         return otpManager.sendOtp(
             target = targetDestination,
             channel = channel,
             purpose = OtpPurpose.REGISTRATION,
-            displayName = displayName
+            displayName = displayName,
+            activity = activity
         )
     }
 
     /**
      * Step 2 for Registration: Validate OTP code.
      */
-    fun verifyRegistrationOtp(
+    suspend fun verifyRegistrationOtp(
         targetDestination: String,
         code: String
     ): Result<Boolean> {
@@ -1062,7 +1067,8 @@ class FirebaseAuthManager(
      */
     suspend fun requestForgotPasswordOtp(
         emailOrPhone: String,
-        channel: OtpChannel
+        channel: OtpChannel,
+        activity: Activity? = null
     ): Result<OtpDispatchResult> {
         val query = emailOrPhone.trim()
         if (query.isEmpty()) {
@@ -1077,36 +1083,40 @@ class FirebaseAuthManager(
         }
 
         val account = userRecord.second
-        val targetDestination = when (channel) {
-            OtpChannel.EMAIL -> account.email.ifBlank { query }
-            OtpChannel.SMS, OtpChannel.WHATSAPP -> account.normalizedPhoneNumber.ifBlank { account.mobileNumber }.ifBlank { query }
+        val normalizedQuery = if (query.contains("@")) {
+            val emailValidation = EmailValidator.validate(query)
+            if (emailValidation is EmailValidationResult.Failure) {
+                return Result.failure(IllegalArgumentException(emailValidation.errorMessage))
+            }
+            (emailValidation as EmailValidationResult.Success).normalizedEmail
+        } else {
+            query
         }
 
         return otpManager.sendOtp(
-            target = targetDestination,
+            target = normalizedQuery,
             channel = channel,
             purpose = OtpPurpose.FORGOT_PASSWORD,
-            displayName = account.displayName
+            displayName = account.displayName,
+            activity = activity
         )
     }
 
     /**
      * Verifies the OTP entered during Forgot Password flow.
      */
-    fun verifyForgotPasswordOtp(
+    suspend fun verifyForgotPasswordOtp(
         emailOrPhone: String,
         code: String
     ): Result<Boolean> {
         val query = emailOrPhone.trim()
-        val userRecord = getFromUserRegistry(query)
-        val target = if (userRecord != null) {
-            val acc = userRecord.second
-            if (query.contains("@")) acc.email.ifBlank { query } else acc.normalizedPhoneNumber.ifBlank { acc.mobileNumber }.ifBlank { query }
+        val normalizedQuery = if (query.contains("@")) {
+            EmailValidator.normalize(query) ?: query
         } else {
             query
         }
         return otpManager.verifyOtp(
-            target = target,
+            target = normalizedQuery,
             code = code,
             purpose = OtpPurpose.FORGOT_PASSWORD
         )
@@ -1136,10 +1146,14 @@ class FirebaseAuthManager(
 
         val account = userRecord.second
         val email = account.email
-        val target = if (query.contains("@")) account.email.ifBlank { query } else account.normalizedPhoneNumber.ifBlank { account.mobileNumber }.ifBlank { query }
+        val normalizedQuery = if (query.contains("@")) {
+            EmailValidator.normalize(query) ?: query
+        } else {
+            query
+        }
 
-        if (!otpManager.isVerified(target, OtpPurpose.FORGOT_PASSWORD)) {
-            val verifyCheck = otpManager.verifyOtp(target, otpCode, OtpPurpose.FORGOT_PASSWORD)
+        if (!otpManager.isVerified(normalizedQuery, OtpPurpose.FORGOT_PASSWORD)) {
+            val verifyCheck = otpManager.verifyOtp(normalizedQuery, otpCode, OtpPurpose.FORGOT_PASSWORD)
             if (verifyCheck.isFailure) {
                 return Result.failure(verifyCheck.exceptionOrNull() ?: Exception("Invalid verification code."))
             }
@@ -1149,7 +1163,7 @@ class FirebaseAuthManager(
         saveToUserRegistry(email, trimmedPass, account)
 
         // Consume the OTP verification session
-        otpManager.consumeVerification(target, OtpPurpose.FORGOT_PASSWORD)
+        otpManager.consumeVerification(normalizedQuery, OtpPurpose.FORGOT_PASSWORD)
 
         // Attempt Firebase Auth password update or email reset link if supported
         auth?.let { fa ->

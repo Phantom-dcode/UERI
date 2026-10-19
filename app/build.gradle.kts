@@ -108,9 +108,7 @@ dependencies {
   implementation(libs.firebase.auth)
   implementation(libs.firebase.storage)
   // implementation(libs.firebase.messaging)
-  implementation(libs.firebase.functions) {
-    exclude(group = "com.google.firebase", module = "firebase-iid")
-  }
+  // implementation(libs.firebase.functions)
   implementation(libs.firebase.appcheck.recaptcha)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)

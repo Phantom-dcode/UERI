@@ -285,7 +285,7 @@ class EmailVerificationDataDrivenTest {
         val target = "expired_${System.currentTimeMillis()}@ueri.org"
         val dispatch = authManager.sendRegistrationOtp(target, OtpChannel.EMAIL, "Expired User")
         assertTrue(dispatch.isSuccess)
-        val code = otpManager.getPendingCodeForTest(target, OtpPurpose.REGISTRATION)!
+        val code = otpManager.getPendingCodeForTest(target, OtpPurpose.REGISTRATION)!!
 
         // Simulate session expiry by directly inspecting session expiration check
         // Calling verifyOtp on non-existent or expired code should fail
@@ -299,7 +299,7 @@ class EmailVerificationDataDrivenTest {
         val target = "reused_${System.currentTimeMillis()}@ueri.org"
         val dispatch = authManager.sendRegistrationOtp(target, OtpChannel.EMAIL, "Reused User")
         assertTrue(dispatch.isSuccess)
-        val code = otpManager.getPendingCodeForTest(target, OtpPurpose.REGISTRATION)!
+        val code = otpManager.getPendingCodeForTest(target, OtpPurpose.REGISTRATION)!!
 
         // First verification succeeds
         val verifyFirst = authManager.verifyRegistrationOtp(target, code)
@@ -331,7 +331,7 @@ class EmailVerificationDataDrivenTest {
         val email = "verified_citizen_${System.currentTimeMillis()}@ueri.org"
         val dispatch = authManager.sendRegistrationOtp(email, OtpChannel.EMAIL, "Legit Citizen")
         assertTrue(dispatch.isSuccess)
-        val code = otpManager.getPendingCodeForTest(email, OtpPurpose.REGISTRATION)!
+        val code = otpManager.getPendingCodeForTest(email, OtpPurpose.REGISTRATION)!!
 
         // Verify valid code
         val verifyRes = authManager.verifyRegistrationOtp(email, code)
