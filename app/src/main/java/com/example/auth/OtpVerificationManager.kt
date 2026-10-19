@@ -1,42 +1,26 @@
 package com.example.auth
 
-import android.app.Activity
 import android.content.Context
 import android.util.Log
 import androidx.annotation.VisibleForTesting
 import com.example.util.EmailValidator
 import com.example.util.EmailValidationResult
-import com.google.firebase.FirebaseException
-import com.google.firebase.FirebaseTooManyRequestsException
-import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
-import com.google.firebase.auth.PhoneAuthCredential
-import com.google.firebase.auth.PhoneAuthOptions
-import com.google.firebase.auth.PhoneAuthProvider
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
+import com.google.firebase.functions.FirebaseFunctionsException
+import com.google.firebase.functions.FirebaseFunctions
 import kotlinx.coroutines.tasks.await
-import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONObject
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
 import kotlin.math.ceil
 
 /**
  * Supported channels for delivering One-Time Passwords in UERI.
  */
-enum class OtpChannel(val displayName: String, val channelLabel: String, val isConfigured: Boolean) {
-    EMAIL("Mail ID (Email)", "Email", true),
-    SMS("Phone Number SMS", "SMS Message", true),
-    WHATSAPP("Phone Number WhatsApp", "WhatsApp (Not Configured)", false)
+enum class OtpChannel(val displayName: String, val channelLabel: String) {
+    EMAIL("Mail ID (Email)", "Email"),
+    SMS("Phone Number SMS", "SMS Message"),
+    WHATSAPP("Phone Number WhatsApp", "WhatsApp")
 }
 
 /**
@@ -45,6 +29,16 @@ enum class OtpChannel(val displayName: String, val channelLabel: String, val isC
 enum class OtpPurpose {
     REGISTRATION,
     FORGOT_PASSWORD
+}
+
+enum class OtpFlowState {
+    IDLE,
+    SENDING,
+    OTP_REQUEST_ACCEPTED,
+    VERIFICATION_PENDING,
+    VERIFIED,
+    SEND_FAILED,
+    DELIVERY_STATUS_UNKNOWN
 }
 
 /**
@@ -61,7 +55,8 @@ data class SecureOtpSession(
     val expiresAt: Long = System.currentTimeMillis() + (10 * 60 * 1000L), // 10 minutes expiry
     var attemptsRemaining: Int = 3,
     var lastSentAt: Long = System.currentTimeMillis(),
-    var isVerified: Boolean = false
+    var isVerified: Boolean = false,
+    val serverManaged: Boolean = false
 ) {
     val isExpired: Boolean
         get() = System.currentTimeMillis() > expiresAt
@@ -75,8 +70,8 @@ data class OtpDispatchResult(
     val formattedTarget: String,
     val deliveryMessage: String,
     val channel: OtpChannel,
-    val state: VerificationFlowState = VerificationFlowState.OTP_REQUEST_ACCEPTED,
-    val typoSuggestion: String? = null
+    val typoSuggestion: String? = null,
+    val state: OtpFlowState = OtpFlowState.OTP_REQUEST_ACCEPTED
 )
 
 /**
@@ -87,12 +82,14 @@ interface EmailDeliveryProvider {
 }
 
 /**
- * Production-grade OTP Verification Lifecycle Manager for UERI:
- * - Thread-safe and main-thread safe (dispatches network/disk on Dispatchers.IO)
- * - Multi-channel: Email (Cloud Function / SMTP), SMS (Real Firebase Phone Auth), WhatsApp (Status reporting)
- * - Strict verification state machine: IDLE -> SENDING -> OTP_REQUEST_ACCEPTED -> VERIFICATION_PENDING -> VERIFIED
- * - Zero plaintext leakage (salted SHA-256 verifier)
- * - Rate limiting (60-second cooldown), expiration (10m), lockout (3 attempts), single-use consumption
+ * Manages OTP lifecycle with zero-trust security:
+ * - Cryptographically secure 6-digit generation (SecureRandom)
+ * - Salted SHA-256 hash verification (never logs or returns plaintext OTP)
+ * - Rate limiting (60-second cooldown)
+ * - Short expiration (10 minutes)
+ * - Maximum attempt enforcement (3 attempts lockout)
+ * - Single-use consumption
+ * - Production delivery is email-only through the Cloud Function; SMS/WhatsApp require a provider integration.
  */
 class OtpVerificationManager(
     private var context: Context? = null
@@ -100,6 +97,7 @@ class OtpVerificationManager(
     companion object {
         private const val TAG = "OtpVerificationMgr"
         private const val PREFS_NAME = "ueri_secure_otp_sessions"
+        private const val FUNCTIONS_REGION = "us-central1"
         private const val RESEND_COOLDOWN_MS = 60_000L // 60 seconds
         private val random = SecureRandom()
 
@@ -132,22 +130,19 @@ class OtpVerificationManager(
     }
 
     private val sessions = ConcurrentHashMap<String, SecureOtpSession>()
-    private val phoneVerificationIds = ConcurrentHashMap<String, String>()
-    private val phoneResendTokens = ConcurrentHashMap<String, PhoneAuthProvider.ForceResendingToken>()
+    private val flowStates = ConcurrentHashMap<String, OtpFlowState>()
 
-    private val httpClient: OkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(15, TimeUnit.SECONDS)
-            .build()
+    private val functions: FirebaseFunctions? by lazy {
+        try {
+            FirebaseFunctions.getInstance(FUNCTIONS_REGION)
+        } catch (e: Exception) {
+            Log.w(TAG, "FirebaseFunctions instance unavailable: ${e.message}")
+            null
+        }
     }
 
     fun attachContext(ctx: Context) {
         this.context = ctx.applicationContext
-    }
-
-    private fun isRobolectric(): Boolean {
-        return "robolectric" == android.os.Build.FINGERPRINT
     }
 
     private fun normalizeKey(target: String, purpose: OtpPurpose): String {
@@ -167,297 +162,191 @@ class OtpVerificationManager(
         return hash.joinToString("") { "%02x".format(it) }
     }
 
-    /**
-     * Executes backend Cloud Function callable on Dispatchers.IO to guarantee main-thread safety.
-     */
-    private suspend fun dispatchViaBackendCallable(email: String): Result<Unit> = withContext(Dispatchers.IO) {
-        val projectId = "project-593ba751-1666-41ff-82b"
-        val region = "us-central1"
-        val url = "https://$region-$projectId.cloudfunctions.net/sendEmailOtp"
+    @VisibleForTesting
+    internal fun emailFunctionError(error: Throwable): Throwable {
+        val functionsError = error as? FirebaseFunctionsException ?: return error
+        return mapEmailFunctionError(functionsError.code, functionsError.message)
+    }
 
-        val jsonBody = JSONObject().apply {
-            put("data", JSONObject().apply {
-                put("email", email)
-            })
-        }.toString()
-
-        val mediaType = "application/json; charset=utf-8".toMediaType()
-        val requestBody = jsonBody.toRequestBody(mediaType)
-        val request = Request.Builder()
-            .url(url)
-            .post(requestBody)
-            .build()
-
-        try {
-            val response = httpClient.newCall(request).execute()
-            val responseBody = response.body?.string() ?: ""
-            if (!response.isSuccessful) {
-                if (response.code == 404) {
-                    Result.failure(
-                        IllegalStateException(
-                            "Email OTP service is not deployed on backend (HTTP 404 at /sendEmailOtp). " +
-                                "Please deploy functions/index.js and configure SMTP secrets (SMTP_HOST, SMTP_USER, SMTP_PASS) in Firebase."
-                        )
-                    )
-                } else {
-                    val errorMsg = try {
-                        val errorObj = JSONObject(responseBody).optJSONObject("error")
-                        errorObj?.optString("message") ?: "Email delivery error (HTTP ${response.code})."
-                    } catch (_: Exception) {
-                        "Email delivery error (HTTP ${response.code})."
-                    }
-                    Result.failure(IllegalStateException(errorMsg))
-                }
-            } else {
-                val resultObj = try {
-                    JSONObject(responseBody).optJSONObject("result")
-                } catch (_: Exception) { null }
-
-                val isSuccess = resultObj?.optBoolean("success", true) ?: true
-                if (!isSuccess) {
-                    val msg = resultObj?.optString("message", "Failed to deliver verification email.") ?: "Failed to deliver verification email."
-                    Result.failure(IllegalStateException(msg))
-                } else {
-                    Result.success(Unit)
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Backend dispatch network error: ${e.message}")
-            Result.failure(e)
+    @VisibleForTesting
+    internal fun mapEmailFunctionError(
+        code: FirebaseFunctionsException.Code,
+        message: String?
+    ): Throwable {
+        return when (code) {
+            FirebaseFunctionsException.Code.NOT_FOUND ->
+                IllegalStateException(
+                    "The email verification service is not deployed for this Firebase project and region. " +
+                        "Deploy the sendEmailOtp Cloud Function to the configured project in us-central1."
+                )
+            FirebaseFunctionsException.Code.FAILED_PRECONDITION ->
+                IllegalStateException(
+                    message
+                        ?: "The email verification service is not configured. Check the backend SMTP settings."
+                )
+            FirebaseFunctionsException.Code.PERMISSION_DENIED,
+            FirebaseFunctionsException.Code.UNAUTHENTICATED ->
+                IllegalStateException(
+                    "Firebase rejected the email verification request. Check the app's Firebase project and Cloud Functions access configuration."
+                )
+            FirebaseFunctionsException.Code.RESOURCE_EXHAUSTED ->
+                IllegalStateException(
+                    message ?: "Too many verification requests. Please wait before trying again."
+                )
+            FirebaseFunctionsException.Code.INVALID_ARGUMENT ->
+                IllegalArgumentException(
+                    message ?: "The email verification request is invalid."
+                )
+            FirebaseFunctionsException.Code.INTERNAL ->
+                IllegalStateException(
+                    message ?: "The email provider could not process the verification request."
+                )
+            FirebaseFunctionsException.Code.UNAVAILABLE,
+            FirebaseFunctionsException.Code.DEADLINE_EXCEEDED,
+            FirebaseFunctionsException.Code.UNKNOWN ->
+                IllegalStateException("The email request could not be confirmed. Delivery status is unknown; check your inbox before retrying.")
+            else -> IllegalStateException(
+                message ?: "Failed to request an email verification code."
+            )
         }
     }
 
     /**
-     * Dispatches OTP using the appropriate real provider asynchronously on Dispatchers.IO:
-     * - Email: Cloud Function / SMTP delivery
-     * - SMS: Real Firebase Phone Authentication flow
-     * - WhatsApp: Rejects send with clear explanation that provider is not configured
+     * Dispatches a cryptographically secure 6-digit OTP.
+     * Enforces strict rate limits, input validation, and zero plaintext exposure.
      */
     suspend fun sendOtp(
         target: String,
         channel: OtpChannel,
         purpose: OtpPurpose,
-        displayName: String? = null,
-        activity: Activity? = null
-    ): Result<OtpDispatchResult> = withContext(Dispatchers.IO) {
+        displayName: String? = null
+    ): Result<OtpDispatchResult> {
         val trimmedTarget = target.trim()
 
-        // 1. WhatsApp is not configured
-        if (channel == OtpChannel.WHATSAPP) {
-            return@withContext Result.failure(
-                IllegalStateException(
-                    "WhatsApp OTP provider is not configured. Please use Email or SMS verification."
-                )
-            )
-        }
-
-        // 2. Validate email syntax before sending
+        // 1. Validate email syntax before sending
         var typoSuggestion: String? = null
         val normalizedTarget = if (channel == OtpChannel.EMAIL) {
             val validation = EmailValidator.validate(trimmedTarget)
             if (validation is EmailValidationResult.Failure) {
-                return@withContext Result.failure(IllegalArgumentException(validation.errorMessage))
+                flowStates[normalizeKey(trimmedTarget, purpose)] = OtpFlowState.SEND_FAILED
+                return Result.failure(IllegalArgumentException(validation.errorMessage))
             }
             val success = validation as EmailValidationResult.Success
             typoSuggestion = success.typoSuggestion
             success.normalizedEmail
         } else {
-            // Validate phone number for SMS
-            if (trimmedTarget.isEmpty() || trimmedTarget.length < 7) {
-                return@withContext Result.failure(IllegalArgumentException("Please enter a valid phone number."))
+            if (!trimmedTarget.matches(Regex("^\\+[1-9]\\d{7,14}$"))) {
+                flowStates[normalizeKey(trimmedTarget, purpose)] = OtpFlowState.SEND_FAILED
+                return Result.failure(IllegalArgumentException("Please enter a valid phone number."))
             }
-            trimmedTarget
+            val channelName = if (channel == OtpChannel.SMS) "SMS" else "WhatsApp"
+            flowStates[normalizeKey(trimmedTarget, purpose)] = OtpFlowState.SEND_FAILED
+            return Result.failure(
+                IllegalStateException("$channelName verification is not configured. Choose email verification.")
+            )
         }
 
         val key = normalizeKey(normalizedTarget, purpose)
+        flowStates[key] = OtpFlowState.SENDING
 
-        // 3. Enforce 60-second resend cooldown rate limit
+        // Enforce a client-side resend cooldown in addition to the server-side limit.
         val existingSession = sessions[key] ?: loadSessionFromPrefs(key, normalizedTarget, purpose)
         val now = System.currentTimeMillis()
         if (existingSession != null && !existingSession.isExpired) {
             val elapsed = now - existingSession.lastSentAt
             if (elapsed < RESEND_COOLDOWN_MS) {
                 val remainingSec = ceil((RESEND_COOLDOWN_MS - elapsed) / 1000.0).toInt().coerceAtLeast(1)
-                return@withContext Result.failure(
-                    IllegalStateException("Please wait $remainingSec seconds before requesting a new code.")
-                )
+                flowStates[key] = if (existingSession.isVerified) {
+                    OtpFlowState.VERIFIED
+                } else {
+                    OtpFlowState.OTP_REQUEST_ACCEPTED
+                }
+                return Result.failure(IllegalStateException("Please wait $remainingSec seconds before requesting a new code."))
             }
         }
 
-        // 4. Generate cryptographically secure 6-digit code (100000 - 999999)
-        val codeInt = 100000 + random.nextInt(900000)
-        val code = codeInt.toString()
-        val salt = generateSalt()
-        val codeHash = computeSha256(code, salt)
-
-        val session = SecureOtpSession(
-            target = normalizedTarget,
-            channel = channel,
-            purpose = purpose,
-            codeHash = codeHash,
-            salt = salt,
-            createdAt = now,
-            lastSentAt = now,
-            expiresAt = now + (10 * 60 * 1000L), // 10 minutes
-            attemptsRemaining = 3,
-            isVerified = false
-        )
-
-        // 5. Channel-specific provider delivery
-        if (channel == OtpChannel.EMAIL) {
-            if (testEmailDeliveryProvider != null) {
-                val providerResult = testEmailDeliveryProvider!!.deliver(normalizedTarget, code)
-                if (providerResult.isFailure) {
-                    return@withContext Result.failure(
-                        providerResult.exceptionOrNull() ?: IllegalStateException("Email delivery provider rejected request.")
+        return try {
+            val testProvider = testEmailDeliveryProvider
+            val session = if (testProvider != null) {
+                val code = (100000 + random.nextInt(900000)).toString()
+                val salt = generateSalt()
+                val delivery = testProvider.deliver(normalizedTarget, code)
+                if (delivery.isFailure) {
+                    throw delivery.exceptionOrNull()
+                        ?: IllegalStateException("Email delivery provider rejected request.")
+                }
+                testOnlyPlaintextCodes[key] = code
+                SecureOtpSession(
+                    target = normalizedTarget,
+                    channel = channel,
+                    purpose = purpose,
+                    codeHash = computeSha256(code, salt),
+                    salt = salt,
+                    createdAt = now,
+                    lastSentAt = now,
+                    expiresAt = now + (10 * 60 * 1000L)
+                )
+            } else {
+                val fn = functions
+                    ?: throw IllegalStateException("Email verification service is unavailable. Please try again later.")
+                val result = fn.getHttpsCallable("sendEmailOtp")
+                    .call(mapOf("email" to normalizedTarget, "purpose" to purpose.name))
+                    .await()
+                val data = result.data as? Map<*, *>
+                if (data?.get("accepted") != true) {
+                    flowStates[key] = OtpFlowState.DELIVERY_STATUS_UNKNOWN
+                    throw IllegalStateException(
+                        "The email provider did not confirm acceptance. Delivery status is unknown; please check your inbox before retrying."
                     )
                 }
-            } else if (!isRobolectric()) {
-                val backendResult = dispatchViaBackendCallable(normalizedTarget)
-                if (backendResult.isFailure) {
-                    val ex = backendResult.exceptionOrNull()
-                    val msg = ex?.message ?: "Failed to deliver verification email."
-                    return@withContext Result.failure(IllegalStateException(msg))
-                }
-            }
-        } else if (channel == OtpChannel.SMS) {
-            val auth = try {
-                FirebaseAuth.getInstance()
-            } catch (e: Exception) {
-                null
+                SecureOtpSession(
+                    target = normalizedTarget,
+                    channel = channel,
+                    purpose = purpose,
+                    codeHash = "",
+                    salt = "",
+                    createdAt = now,
+                    lastSentAt = now,
+                    expiresAt = now + (10 * 60 * 1000L),
+                    serverManaged = true
+                )
             }
 
-            // If real Android device with Activity and Firebase Auth configured:
-            if (auth != null && activity != null && !isRobolectric()) {
-                val phoneResult = sendFirebasePhoneAuth(auth, activity, normalizedTarget, session, key)
-                if (phoneResult.isFailure) {
-                    return@withContext phoneResult
-                }
-                // SMS dispatch initiated via real Firebase Phone Auth
-                return@withContext phoneResult
-            }
-        }
-
-        // Store session for verification
-        sessions[key] = session
-        saveSessionToPrefs(key, session)
-
-        // Stored only for headless unit/Robolectric tests without production exposure
-        testOnlyPlaintextCodes[key] = code
-
-        val neutralMessage = if (channel == OtpChannel.EMAIL) {
-            "Verification email request accepted. If this address can receive mail, an OTP has been dispatched."
-        } else {
-            "Verification SMS request accepted. An OTP has been dispatched to $normalizedTarget."
-        }
-
-        Log.i(TAG, "OTP verification initiated for [${normalizedTarget.take(3)}***] via ${channel.name}.")
-
-        return@withContext Result.success(
-            OtpDispatchResult(
-                formattedTarget = normalizedTarget,
-                deliveryMessage = neutralMessage,
-                channel = channel,
-                state = VerificationFlowState.OTP_REQUEST_ACCEPTED,
-                typoSuggestion = typoSuggestion
+            sessions[key] = session
+            saveSessionToPrefs(key, session)
+            flowStates[key] = OtpFlowState.OTP_REQUEST_ACCEPTED
+            Log.i(TAG, "Email OTP request accepted for [${normalizedTarget.take(3)}***]. Inbox delivery is not confirmed.")
+            Result.success(
+                OtpDispatchResult(
+                    formattedTarget = normalizedTarget,
+                    deliveryMessage = "The email provider accepted the verification request. Delivery to your inbox is not confirmed.",
+                    channel = channel,
+                    typoSuggestion = typoSuggestion
+                )
             )
-        )
-    }
-
-    /**
-     * Bridges Firebase Phone Auth asynchronous callbacks into coroutines without blocking main thread.
-     */
-    private suspend fun sendFirebasePhoneAuth(
-        auth: FirebaseAuth,
-        activity: Activity,
-        phoneNumber: String,
-        session: SecureOtpSession,
-        key: String
-    ): Result<OtpDispatchResult> = suspendCancellableCoroutine { continuation ->
-        val callbacks = object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
-            override fun onCodeSent(
-                verificationId: String,
-                token: PhoneAuthProvider.ForceResendingToken
-            ) {
-                Log.i(TAG, "Firebase SMS gateway dispatched code for $phoneNumber")
-                val phoneSession = session.copy(
-                    codeHash = verificationId,
-                    salt = "FIREBASE_PHONE_AUTH"
-                )
-                sessions[key] = phoneSession
-                saveSessionToPrefs(key, phoneSession)
-                phoneVerificationIds[key] = verificationId
-                phoneResendTokens[key] = token
-
-                if (continuation.isActive) {
-                    continuation.resume(
-                        Result.success(
-                            OtpDispatchResult(
-                                formattedTarget = phoneNumber,
-                                deliveryMessage = "SMS verification code dispatched to $phoneNumber via Firebase.",
-                                channel = OtpChannel.SMS,
-                                state = VerificationFlowState.OTP_REQUEST_ACCEPTED
-                            )
-                        )
-                    )
+        } catch (error: Exception) {
+            val mappedError = emailFunctionError(error)
+            if (flowStates[key] != OtpFlowState.DELIVERY_STATUS_UNKNOWN) {
+                flowStates[key] = if (mappedError.message?.contains("status is unknown", ignoreCase = true) == true) {
+                    OtpFlowState.DELIVERY_STATUS_UNKNOWN
+                } else {
+                    OtpFlowState.SEND_FAILED
                 }
             }
-
-            override fun onVerificationCompleted(credential: PhoneAuthCredential) {
-                Log.i(TAG, "Phone auto-retrieval verification completed for $phoneNumber")
-                session.isVerified = true
-                sessions[key] = session
-                saveSessionToPrefs(key, session)
-
-                if (continuation.isActive) {
-                    continuation.resume(
-                        Result.success(
-                            OtpDispatchResult(
-                                formattedTarget = phoneNumber,
-                                deliveryMessage = "Phone number verified automatically by SMS auto-retrieval.",
-                                channel = OtpChannel.SMS,
-                                state = VerificationFlowState.VERIFIED
-                            )
-                        )
-                    )
-                }
-            }
-
-            override fun onVerificationFailed(e: FirebaseException) {
-                Log.e(TAG, "Firebase Phone Auth delivery failed: ${e.message}", e)
-                val userFriendlyMessage = when (e) {
-                    is FirebaseAuthInvalidCredentialsException ->
-                        "Invalid phone number or rejected by SMS carrier: ${e.localizedMessage}"
-                    is FirebaseTooManyRequestsException ->
-                        "SMS quota for this project has been exceeded. Please try again later or use Email."
-                    else ->
-                        e.localizedMessage ?: "Failed to send SMS verification code."
-                }
-                if (continuation.isActive) {
-                    continuation.resume(Result.failure(Exception(userFriendlyMessage)))
-                }
-            }
+            Log.e(TAG, "Email OTP request failed (${flowStates[key]}): ${mappedError.message}", error)
+            Result.failure(mappedError)
         }
-
-        val options = PhoneAuthOptions.newBuilder(auth)
-            .setPhoneNumber(phoneNumber)
-            .setTimeout(60L, TimeUnit.SECONDS)
-            .setActivity(activity)
-            .setCallbacks(callbacks)
-            .build()
-
-        PhoneAuthProvider.verifyPhoneNumber(options)
     }
 
     /**
-     * Verifies the entered 6-digit OTP asynchronously on Dispatchers.IO to ensure zero UI thread stalls.
+     * Verifies the entered 6-digit OTP against the salted hash with constant-time comparison.
      */
-    suspend fun verifyOtp(target: String, code: String, purpose: OtpPurpose): Result<Boolean> = withContext(Dispatchers.IO) {
+    suspend fun verifyOtp(target: String, code: String, purpose: OtpPurpose): Result<Boolean> {
         val trimmedTarget = target.trim()
         val trimmedCode = code.trim()
 
         if (trimmedCode.length != 6 || !trimmedCode.all { it.isDigit() }) {
-            return@withContext Result.failure(IllegalArgumentException("Invalid or expired verification code. Please try again."))
+            return Result.failure(IllegalArgumentException("Invalid or expired verification code. Please try again."))
         }
 
         val normalizedTarget = if (trimmedTarget.contains("@")) {
@@ -468,74 +357,81 @@ class OtpVerificationManager(
 
         val key = normalizeKey(normalizedTarget, purpose)
         val session = sessions[key] ?: loadSessionFromPrefs(key, normalizedTarget, purpose)
-
-        if (session == null) {
-            return@withContext Result.failure(IllegalArgumentException("Invalid or expired verification code. Please try again."))
-        }
-
-        if (session.isExpired) {
+        if (session?.isExpired == true) {
             consumeVerification(normalizedTarget, purpose)
-            return@withContext Result.failure(IllegalArgumentException("Invalid or expired verification code. Please try again."))
+            return Result.failure(IllegalArgumentException("Invalid or expired verification code. Please try again."))
+        }
+        if (session?.isVerified == true) {
+            flowStates[key] = OtpFlowState.VERIFIED
+            return Result.failure(IllegalArgumentException("This verification code has already been used."))
         }
 
-        // Reused OTP rejection: Once marked verified or consumed, it cannot be verified again
-        if (session.isVerified) {
-            return@withContext Result.failure(IllegalArgumentException("This verification code has already been used."))
-        }
-
-        if (session.attemptsRemaining <= 0) {
+        if (session != null && session.attemptsRemaining <= 0) {
             consumeVerification(normalizedTarget, purpose)
-            return@withContext Result.failure(IllegalArgumentException("Too many failed attempts. Please request a new code."))
+            return Result.failure(IllegalArgumentException("Too many failed attempts. Please request a new code."))
         }
 
-        // Check if verified via Firebase Phone Auth
-        if (session.channel == OtpChannel.SMS && session.salt == "FIREBASE_PHONE_AUTH") {
-            val verificationId = phoneVerificationIds[key] ?: session.codeHash
-            val auth = try { FirebaseAuth.getInstance() } catch (_: Exception) { null }
-            if (auth != null) {
-                return@withContext try {
-                    val credential = PhoneAuthProvider.getCredential(verificationId, trimmedCode)
-                    auth.signInWithCredential(credential).await()
-                    session.isVerified = true
-                    saveSessionToPrefs(key, session)
-                    Log.i(TAG, "Firebase Phone Auth code validated for [${normalizedTarget.take(3)}***]")
-                    Result.success(true)
-                } catch (e: Exception) {
-                    session.attemptsRemaining -= 1
-                    saveSessionToPrefs(key, session)
-                    if (session.attemptsRemaining <= 0) {
-                        consumeVerification(normalizedTarget, purpose)
-                        Result.failure(IllegalArgumentException("Too many failed attempts. Please request a new code."))
-                    } else {
-                        Result.failure(IllegalArgumentException("Invalid or expired verification code. Please try again."))
-                    }
+        flowStates[key] = OtpFlowState.VERIFICATION_PENDING
+        if (testEmailDeliveryProvider != null) {
+            if (session == null || session.serverManaged) {
+                return Result.failure(IllegalArgumentException("Invalid or expired verification code. Please try again."))
+            }
+            val expectedHash = computeSha256(trimmedCode, session.salt)
+            val isMatch = MessageDigest.isEqual(
+                expectedHash.toByteArray(Charsets.UTF_8),
+                session.codeHash.toByteArray(Charsets.UTF_8)
+            )
+            if (!isMatch) {
+                session.attemptsRemaining -= 1
+                saveSessionToPrefs(key, session)
+                if (session.attemptsRemaining <= 0) {
+                    consumeVerification(normalizedTarget, purpose)
+                    flowStates[key] = OtpFlowState.SEND_FAILED
+                    return Result.failure(IllegalArgumentException("Too many failed attempts. Please request a new code."))
                 }
+                return Result.failure(IllegalArgumentException("Invalid or expired verification code. Please try again."))
+            }
+        } else {
+            if (!normalizedTarget.contains("@")) {
+                return Result.failure(IllegalStateException("Phone verification is not configured. Choose email verification."))
+            }
+            try {
+                val fn = functions
+                    ?: throw IllegalStateException("Email verification service is unavailable. Please try again later.")
+                val result = fn.getHttpsCallable("verifyEmailOtp")
+                    .call(
+                        mapOf(
+                            "email" to normalizedTarget,
+                            "code" to trimmedCode,
+                            "purpose" to purpose.name
+                        )
+                    )
+                    .await()
+                val data = result.data as? Map<*, *>
+                if (data?.get("verified") != true) {
+                    return Result.failure(IllegalArgumentException("Invalid or expired verification code. Please try again."))
+                }
+            } catch (error: Exception) {
+                val mappedError = emailFunctionError(error)
+                Log.w(TAG, "Email OTP verification failed: ${mappedError.message}")
+                return Result.failure(mappedError)
             }
         }
 
-        // Standard salted SHA-256 hash comparison with constant-time check
-        val expectedHash = computeSha256(trimmedCode, session.salt)
-        val isMatch = MessageDigest.isEqual(
-            expectedHash.toByteArray(Charsets.UTF_8),
-            session.codeHash.toByteArray(Charsets.UTF_8)
+        val verifiedSession = session ?: SecureOtpSession(
+            target = normalizedTarget,
+            channel = OtpChannel.EMAIL,
+            purpose = purpose,
+            codeHash = "",
+            salt = "",
+            serverManaged = true
         )
-
-        if (!isMatch) {
-            session.attemptsRemaining -= 1
-            saveSessionToPrefs(key, session)
-            if (session.attemptsRemaining <= 0) {
-                consumeVerification(normalizedTarget, purpose)
-                return@withContext Result.failure(IllegalArgumentException("Too many failed attempts. Please request a new code."))
-            }
-            return@withContext Result.failure(IllegalArgumentException("Invalid or expired verification code. Please try again."))
-        }
-
-        // Verification successful
-        session.isVerified = true
-        saveSessionToPrefs(key, session)
-
+        verifiedSession.isVerified = true
+        sessions[key] = verifiedSession
+        saveSessionToPrefs(key, verifiedSession)
+        flowStates[key] = OtpFlowState.VERIFIED
         Log.i(TAG, "OTP verification successful for [${normalizedTarget.take(3)}***]")
-        return@withContext Result.success(true)
+        return Result.success(true)
     }
 
     /**
@@ -545,7 +441,12 @@ class OtpVerificationManager(
         val normalized = if (target.contains("@")) EmailValidator.normalize(target) ?: target.trim() else target.trim()
         val key = normalizeKey(normalized, purpose)
         val session = sessions[key] ?: loadSessionFromPrefs(key, normalized, purpose)
-        return session != null && session.isVerified && !session.isExpired
+        return session != null && session.channel == OtpChannel.EMAIL && session.isVerified && !session.isExpired
+    }
+
+    fun state(target: String, purpose: OtpPurpose): OtpFlowState {
+        val normalized = if (target.contains("@")) EmailValidator.normalize(target) ?: target.trim() else target.trim()
+        return flowStates[normalizeKey(normalized, purpose)] ?: OtpFlowState.IDLE
     }
 
     /**
@@ -555,9 +456,8 @@ class OtpVerificationManager(
         val normalized = if (target.contains("@")) EmailValidator.normalize(target) ?: target.trim() else target.trim()
         val key = normalizeKey(normalized, purpose)
         sessions.remove(key)
-        phoneVerificationIds.remove(key)
-        phoneResendTokens.remove(key)
         testOnlyPlaintextCodes.remove(key)
+        flowStates[key] = OtpFlowState.IDLE
         context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)?.edit()
             ?.remove("hash_$key")
             ?.remove("salt_$key")
@@ -566,26 +466,40 @@ class OtpVerificationManager(
             ?.remove("last_sent_$key")
             ?.remove("channel_$key")
             ?.remove("verified_$key")
-            ?.remove("phone_vid_$key")
             ?.apply()
     }
 
     private fun saveSessionToPrefs(key: String, session: SecureOtpSession) {
-        context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)?.edit()
-            ?.putString("hash_$key", session.codeHash)
-            ?.putString("salt_$key", session.salt)
-            ?.putLong("expires_$key", session.expiresAt)
-            ?.putInt("attempts_$key", session.attemptsRemaining)
-            ?.putLong("last_sent_$key", session.lastSentAt)
-            ?.putString("channel_$key", session.channel.name)
-            ?.putBoolean("verified_$key", session.isVerified)
-            ?.apply()
+        val editor = context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)?.edit() ?: return
+        editor.putLong("expires_$key", session.expiresAt)
+            .putInt("attempts_$key", session.attemptsRemaining)
+            .putLong("last_sent_$key", session.lastSentAt)
+            .putString("channel_$key", session.channel.name)
+            .putBoolean("verified_$key", session.isVerified)
+            .putBoolean("server_managed_$key", session.serverManaged)
+        if (session.serverManaged) {
+            editor.remove("hash_$key").remove("salt_$key")
+        } else {
+            editor.putString("hash_$key", session.codeHash).putString("salt_$key", session.salt)
+        }
+        editor.apply()
     }
 
     private fun loadSessionFromPrefs(key: String, target: String, purpose: OtpPurpose): SecureOtpSession? {
         val prefs = context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) ?: return null
-        val hash = prefs.getString("hash_$key", null) ?: return null
-        val salt = prefs.getString("salt_$key", null) ?: return null
+        val serverManaged = prefs.getBoolean("server_managed_$key", false)
+        if (!serverManaged) {
+            prefs.edit()
+                .remove("hash_$key")
+                .remove("salt_$key")
+                .remove("expires_$key")
+                .remove("attempts_$key")
+                .remove("last_sent_$key")
+                .remove("channel_$key")
+                .remove("verified_$key")
+                .apply()
+            return null
+        }
         val expiresAt = prefs.getLong("expires_$key", 0L)
         val attempts = prefs.getInt("attempts_$key", 3)
         val lastSent = prefs.getLong("last_sent_$key", 0L)
@@ -597,12 +511,13 @@ class OtpVerificationManager(
             target = target,
             channel = channel,
             purpose = purpose,
-            codeHash = hash,
-            salt = salt,
+            codeHash = "",
+            salt = "",
             expiresAt = expiresAt,
             attemptsRemaining = attempts,
             lastSentAt = lastSent,
-            isVerified = verified
+            isVerified = verified,
+            serverManaged = true
         )
     }
 
@@ -616,8 +531,7 @@ class OtpVerificationManager(
     @VisibleForTesting
     fun clearAllForTest() {
         sessions.clear()
-        phoneVerificationIds.clear()
-        phoneResendTokens.clear()
+        flowStates.clear()
         testOnlyPlaintextCodes.clear()
         testEmailDeliveryProvider = null
     }

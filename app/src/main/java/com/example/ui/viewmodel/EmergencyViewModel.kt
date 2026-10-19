@@ -1,14 +1,11 @@
 package com.example.ui.viewmodel
 
-import android.app.Activity
 import android.app.Application
 import android.graphics.Bitmap
 import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import com.example.data.AppDatabase
 import com.example.data.EmergencyRepository
 import com.example.data.FirestoreEmergencyRepository
@@ -573,13 +570,10 @@ class EmergencyViewModel(application: Application) : AndroidViewModel(applicatio
         target: String,
         channel: OtpChannel,
         displayName: String,
-        activity: Activity? = null,
         onResult: (Result<OtpDispatchResult>) -> Unit
     ) {
         viewModelScope.launch {
-            val res = withContext(Dispatchers.IO) {
-                authManager.sendRegistrationOtp(target, channel, displayName, activity)
-            }
+            val res = authManager.sendRegistrationOtp(target, channel, displayName)
             onResult(res)
         }
     }
@@ -590,9 +584,7 @@ class EmergencyViewModel(application: Application) : AndroidViewModel(applicatio
         onResult: (Result<Boolean>) -> Unit
     ) {
         viewModelScope.launch {
-            val res = withContext(Dispatchers.IO) {
-                authManager.verifyRegistrationOtp(target, code)
-            }
+            val res = authManager.verifyRegistrationOtp(target, code)
             onResult(res)
         }
     }
@@ -600,13 +592,10 @@ class EmergencyViewModel(application: Application) : AndroidViewModel(applicatio
     fun sendForgotPasswordOtp(
         emailOrPhone: String,
         channel: OtpChannel,
-        activity: Activity? = null,
         onResult: (Result<OtpDispatchResult>) -> Unit
     ) {
         viewModelScope.launch {
-            val res = withContext(Dispatchers.IO) {
-                authManager.requestForgotPasswordOtp(emailOrPhone, channel, activity)
-            }
+            val res = authManager.requestForgotPasswordOtp(emailOrPhone, channel)
             onResult(res)
         }
     }
@@ -617,9 +606,7 @@ class EmergencyViewModel(application: Application) : AndroidViewModel(applicatio
         onResult: (Result<Boolean>) -> Unit
     ) {
         viewModelScope.launch {
-            val res = withContext(Dispatchers.IO) {
-                authManager.verifyForgotPasswordOtp(emailOrPhone, code)
-            }
+            val res = authManager.verifyForgotPasswordOtp(emailOrPhone, code)
             onResult(res)
         }
     }
@@ -628,12 +615,11 @@ class EmergencyViewModel(application: Application) : AndroidViewModel(applicatio
         emailOrPhone: String,
         otpCode: String,
         newPassword: String,
-        onResult: (Result<String>) -> Unit
+        onResult: (Result<String>) -> Unit,
+        otpVerifiedTarget: String? = null
     ) {
         viewModelScope.launch {
-            val res = withContext(Dispatchers.IO) {
-                authManager.resetPasswordWithOtp(emailOrPhone, otpCode, newPassword)
-            }
+            val res = authManager.resetPasswordWithOtp(emailOrPhone, otpCode, newPassword, otpVerifiedTarget)
             onResult(res)
         }
     }

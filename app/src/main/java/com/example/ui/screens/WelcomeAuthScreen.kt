@@ -153,6 +153,7 @@ fun WelcomeAuthScreen(
     // Forgot Password Flow Step State
     var forgotStep by rememberSaveable { mutableStateOf(ForgotPasswordStep.IDENTIFY_AND_CHANNEL) }
     var forgotQuery by rememberSaveable { mutableStateOf("") }
+    var forgotOtpTarget by rememberSaveable { mutableStateOf("") }
     var forgotOtpChannel by rememberSaveable { mutableStateOf(OtpChannel.EMAIL) }
     var forgotOtpCode by rememberSaveable { mutableStateOf("") }
     var forgotNewPassword by rememberSaveable { mutableStateOf("") }
@@ -474,6 +475,7 @@ fun WelcomeAuthScreen(
                                         authMode = AuthMode.FORGOT_PASSWORD
                                         forgotStep = ForgotPasswordStep.IDENTIFY_AND_CHANNEL
                                         forgotQuery = email.trim()
+                                        forgotOtpTarget = ""
                                         errorMessage = null
                                         resetSuccessMessage = null
                                     }
@@ -701,8 +703,7 @@ fun WelcomeAuthScreen(
                                 OtpChannelSelector(
                                     selectedChannel = regOtpChannel,
                                     onSelectChannel = { regOtpChannel = it },
-                                    emailText = email.ifBlank { "Registered Email" },
-                                    phoneText = if (nationalPhoneNumber.isNotBlank()) "${currentCountry.callingCode} $nationalPhoneNumber" else "Phone Number"
+                                    emailText = email.ifBlank { "Registered Email" }
                                 )
 
                                 Spacer(modifier = Modifier.height(20.dp))
@@ -1121,7 +1122,7 @@ fun WelcomeAuthScreen(
 
                                 OutlinedTextField(
                                     value = forgotQuery,
-                                    onValueChange = { forgotQuery = it; errorMessage = null },
+                                    onValueChange = { forgotQuery = it; forgotOtpTarget = ""; errorMessage = null },
                                     label = { Text("Registered Email or Phone") },
                                     placeholder = { Text("e.g. name@example.com or +91...") },
                                     leadingIcon = {
@@ -1149,8 +1150,7 @@ fun WelcomeAuthScreen(
                                 OtpChannelSelector(
                                     selectedChannel = forgotOtpChannel,
                                     onSelectChannel = { forgotOtpChannel = it },
-                                    emailText = if (forgotQuery.contains("@")) forgotQuery else "Registered Mail ID",
-                                    phoneText = if (!forgotQuery.contains("@") && forgotQuery.isNotBlank()) forgotQuery else "Registered Phone Number"
+                                    emailText = if (forgotQuery.contains("@")) forgotQuery else "Registered Mail ID"
                                 )
 
                                 Spacer(modifier = Modifier.height(20.dp))
@@ -1163,7 +1163,7 @@ fun WelcomeAuthScreen(
                                             return@Button
                                         }
 
-                                        val targetToSend = if (forgotOtpChannel == OtpChannel.EMAIL) {
+                                        val targetToSend = if (forgotOtpChannel == OtpChannel.EMAIL && trimmedQuery.contains("@")) {
                                             val emailValidation = EmailValidator.validate(trimmedQuery)
                                             if (emailValidation is EmailValidationResult.Failure) {
                                                 errorMessage = emailValidation.errorMessage
@@ -1182,6 +1182,7 @@ fun WelcomeAuthScreen(
                                             res.fold(
                                                 onSuccess = { dispatch ->
                                                     forgotOtpCode = ""
+                                                    forgotOtpTarget = dispatch.formattedTarget
                                                     forgotStep = ForgotPasswordStep.VERIFY_OTP
                                                     resetSuccessMessage = dispatch.deliveryMessage
                                                 },
@@ -1277,7 +1278,8 @@ fun WelcomeAuthScreen(
                                         isLoading = true
                                         errorMessage = null
 
-                                        viewModel.verifyForgotPasswordOtp(forgotQuery.trim(), forgotOtpCode.trim()) { res ->
+                                        val targetToVerify = forgotOtpTarget.ifBlank { forgotQuery.trim() }
+                                        viewModel.verifyForgotPasswordOtp(targetToVerify, forgotOtpCode.trim()) { res ->
                                             isLoading = false
                                             res.fold(
                                                 onSuccess = {
@@ -1335,11 +1337,12 @@ fun WelcomeAuthScreen(
                                                 if (isLoading) return@clickable
                                                 isLoading = true
                                                 errorMessage = null
-                                                viewModel.sendForgotPasswordOtp(forgotQuery.trim(), forgotOtpChannel) { res ->
+                                                viewModel.sendForgotPasswordOtp(forgotOtpTarget.ifBlank { forgotQuery.trim() }, forgotOtpChannel) { res ->
                                                     isLoading = false
                                                     res.fold(
                                                         onSuccess = { d ->
                                                             forgotOtpCode = ""
+                                                            forgotOtpTarget = d.formattedTarget
                                                             resetSuccessMessage = d.deliveryMessage
                                                         },
                                                         onFailure = { err ->
@@ -1442,12 +1445,16 @@ fun WelcomeAuthScreen(
                                         isLoading = true
                                         errorMessage = null
 
-                                        viewModel.resetPasswordWithOtp(forgotQuery.trim(), forgotOtpCode.trim(), trimmedPass) { res ->
+                                        viewModel.resetPasswordWithOtp(
+                                            forgotQuery.trim(),
+                                            forgotOtpCode.trim(),
+                                            trimmedPass,
+                                            onResult = { res ->
                                             isLoading = false
                                             res.fold(
                                                 onSuccess = { successMsg ->
                                                     authMode = AuthMode.LOGIN
-                                                    email = forgotQuery.trim()
+                                                    email = if (forgotOtpTarget.contains("@")) forgotOtpTarget else forgotQuery.trim()
                                                     password = ""
                                                     resetSuccessMessage = successMsg
                                                 },
@@ -1455,7 +1462,9 @@ fun WelcomeAuthScreen(
                                                     errorMessage = err.message ?: "Failed to reset password."
                                                 }
                                             )
-                                        }
+                                            },
+                                            otpVerifiedTarget = forgotOtpTarget
+                                        )
                                     },
                                     enabled = !isLoading,
                                     shape = RoundedCornerShape(16.dp),
@@ -1622,8 +1631,7 @@ fun WelcomeAuthScreen(
 private fun OtpChannelSelector(
     selectedChannel: OtpChannel,
     onSelectChannel: (OtpChannel) -> Unit,
-    emailText: String,
-    phoneText: String
+    emailText: String
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -1640,8 +1648,8 @@ private fun OtpChannelSelector(
 
         OtpChannelItem(
             channel = OtpChannel.SMS,
-            label = "Phone Number SMS Message",
-            detail = phoneText,
+            label = "Phone Number SMS Message (Not configured)",
+            detail = "SMS delivery is unavailable in this build",
             icon = Icons.Default.Sms,
             isSelected = selectedChannel == OtpChannel.SMS,
             onClick = { onSelectChannel(OtpChannel.SMS) }
@@ -1649,8 +1657,8 @@ private fun OtpChannelSelector(
 
         OtpChannelItem(
             channel = OtpChannel.WHATSAPP,
-            label = "Phone Number WhatsApp",
-            detail = phoneText,
+            label = "Phone Number WhatsApp (Not configured)",
+            detail = "WhatsApp delivery is unavailable in this build",
             icon = Icons.Default.Phone,
             isSelected = selectedChannel == OtpChannel.WHATSAPP,
             onClick = { onSelectChannel(OtpChannel.WHATSAPP) }
@@ -1667,8 +1675,10 @@ private fun OtpChannelItem(
     isSelected: Boolean,
     onClick: () -> Unit
 ) {
+    val isAvailable = channel == OtpChannel.EMAIL
     Surface(
         onClick = onClick,
+        enabled = channel == OtpChannel.EMAIL,
         shape = RoundedCornerShape(12.dp),
         color = if (isSelected) Color(0xFFEFF6FF) else Color(0xFFF8FAFC),
         border = androidx.compose.foundation.BorderStroke(
@@ -1705,12 +1715,16 @@ private fun OtpChannelItem(
                     text = label,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
-                    color = if (isSelected) BrandBlue else TextSlate900
+                    color = when {
+                        isSelected -> BrandBlue
+                        !isAvailable -> TextSlate400
+                        else -> TextSlate900
+                    }
                 )
                 Text(
                     text = detail,
                     fontSize = 10.sp,
-                    color = TextSlate500
+                    color = if (isAvailable) TextSlate500 else TextSlate400
                 )
             }
 

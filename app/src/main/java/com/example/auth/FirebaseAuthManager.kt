@@ -1,6 +1,5 @@
 package com.example.auth
 
-import android.app.Activity
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
@@ -11,8 +10,6 @@ import com.example.model.ueri.UserAccount
 import com.example.model.ueri.UserRole
 import com.example.util.PhoneNumberValidator
 import com.example.util.PhoneValidationResult
-import com.example.util.EmailValidator
-import com.example.util.EmailValidationResult
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
 import com.google.firebase.auth.FirebaseAuthInvalidUserException
@@ -65,11 +62,13 @@ class FirebaseAuthManager(
         const val KEY_LOCAL_ROLE = "local_role"
         const val KEY_DISPLAY_NAME = "display_name"
         const val KEY_EMAIL = "email"
+        const val KEY_EMAIL_VERIFIED = "email_verified"
         const val KEY_MOBILE = "mobile_number"
         const val KEY_COUNTRY_ISO = "country_iso_code"
         const val KEY_COUNTRY_CALLING_CODE = "country_calling_code"
         const val KEY_NATIONAL_PHONE = "national_phone_number"
         const val KEY_NORMALIZED_PHONE = "normalized_phone_number"
+        const val KEY_PHONE_VERIFIED = "phone_verified"
         const val KEY_FCM_TOKEN = "fcm_push_token"
         const val KEY_RESPONDER_ID = "responder_id"
         const val KEY_VERIFIED_RESPONDER = "verified_responder"
@@ -218,6 +217,8 @@ class FirebaseAuthManager(
             uid = uid.ifEmpty { UUID.randomUUID().toString() },
             displayName = displayName,
             email = email,
+            emailVerified = prefs?.getBoolean(KEY_EMAIL_VERIFIED, auth?.currentUser?.isEmailVerified == true)
+                ?: (auth?.currentUser?.isEmailVerified == true),
             mobileNumber = if (normalizedPhone.isNotBlank()) normalizedPhone else mobile,
             countryIsoCode = countryIso,
             countryCallingCode = countryCalling,
@@ -225,7 +226,8 @@ class FirebaseAuthManager(
             normalizedPhoneNumber = normalizedPhone,
             role = roleStr,
             responderId = responderId,
-            phoneVerified = (normalizedPhone.isNotBlank() || mobile.isNotBlank() || auth?.currentUser?.phoneNumber != null),
+            phoneVerified = prefs?.getBoolean(KEY_PHONE_VERIFIED, auth?.currentUser?.phoneNumber != null)
+                ?: (auth?.currentUser?.phoneNumber != null),
             verifiedResponder = verifiedResponder,
             responderAvailability = true,
             pushToken = pushToken,
@@ -321,11 +323,13 @@ class FirebaseAuthManager(
             ?.putString(KEY_LOCAL_UID, account.uid)
             ?.putString(KEY_DISPLAY_NAME, account.displayName)
             ?.putString(KEY_EMAIL, account.email)
+            ?.putBoolean(KEY_EMAIL_VERIFIED, account.emailVerified)
             ?.putString(KEY_MOBILE, account.mobileNumber)
             ?.putString(KEY_COUNTRY_ISO, account.countryIsoCode)
             ?.putString(KEY_COUNTRY_CALLING_CODE, account.countryCallingCode)
             ?.putString(KEY_NATIONAL_PHONE, account.nationalPhoneNumber)
             ?.putString(KEY_NORMALIZED_PHONE, account.normalizedPhoneNumber)
+            ?.putBoolean(KEY_PHONE_VERIFIED, account.phoneVerified)
             ?.putString(KEY_LOCAL_ROLE, account.role)
             ?.putString(KEY_RESPONDER_ID, account.responderId)
             ?.putBoolean(KEY_VERIFIED_RESPONDER, account.verifiedResponder)
@@ -346,6 +350,7 @@ class FirebaseAuthManager(
             put("role", account.role)
             put("responderId", account.responderId)
             put("phoneVerified", account.phoneVerified)
+            put("emailVerified", account.emailVerified)
             put("verifiedResponder", account.verifiedResponder)
             put("responderAvailability", account.responderAvailability)
             put("pushToken", account.pushToken)
@@ -366,7 +371,8 @@ class FirebaseAuthManager(
             normalizedPhoneNumber = json.optString("normalizedPhoneNumber"),
             role = json.optString("role", UserRole.CITIZEN.name),
             responderId = json.optString("responderId"),
-            phoneVerified = json.optBoolean("phoneVerified", true),
+            phoneVerified = json.optBoolean("phoneVerified", false),
+            emailVerified = json.optBoolean("emailVerified", false),
             verifiedResponder = json.optBoolean("verifiedResponder", false),
             responderAvailability = json.optBoolean("responderAvailability", true),
             pushToken = json.optString("pushToken"),
@@ -640,10 +646,11 @@ class FirebaseAuthManager(
                     uid = uid,
                     displayName = displayName,
                     email = trimmedEmail,
+                    emailVerified = fbUser.isEmailVerified,
                     mobileNumber = prefs?.getString(KEY_MOBILE, "") ?: "",
                     role = prefs?.getString(KEY_LOCAL_ROLE, UserRole.CITIZEN.name) ?: UserRole.CITIZEN.name,
                     responderId = prefs?.getString(KEY_RESPONDER_ID, "") ?: "",
-                    phoneVerified = true,
+                    phoneVerified = firebaseAuth.currentUser?.phoneNumber != null,
                     verifiedResponder = prefs?.getBoolean(KEY_VERIFIED_RESPONDER, false) ?: false,
                     responderAvailability = true,
                     createdAt = System.currentTimeMillis(),
@@ -755,15 +762,13 @@ class FirebaseAuthManager(
     suspend fun sendRegistrationOtp(
         targetDestination: String,
         channel: OtpChannel,
-        displayName: String,
-        activity: Activity? = null
+        displayName: String
     ): Result<OtpDispatchResult> {
         return otpManager.sendOtp(
             target = targetDestination,
             channel = channel,
             purpose = OtpPurpose.REGISTRATION,
-            displayName = displayName,
-            activity = activity
+            displayName = displayName
         )
     }
 
@@ -853,7 +858,10 @@ class FirebaseAuthManager(
                 normalizedPhoneNumber = validPhone.normalizedPhoneNumber,
                 role = UserRole.CITIZEN.name,
                 responderId = "",
-                phoneVerified = true,
+                phoneVerified = otpVerifiedTarget == validPhone.normalizedPhoneNumber &&
+                    otpManager.isVerified(validPhone.normalizedPhoneNumber, OtpPurpose.REGISTRATION),
+                emailVerified = otpVerifiedTarget.equals(normalizedEmail, ignoreCase = true) &&
+                    otpManager.isVerified(normalizedEmail, OtpPurpose.REGISTRATION),
                 verifiedResponder = false,
                 responderAvailability = false,
                 pushToken = existingPushToken,
@@ -996,7 +1004,10 @@ class FirebaseAuthManager(
                 normalizedPhoneNumber = validPhone.normalizedPhoneNumber,
                 role = UserRole.RESPONDER.name,
                 responderId = assignedRespId,
-                phoneVerified = true,
+                phoneVerified = otpVerifiedTarget == validPhone.normalizedPhoneNumber &&
+                    otpManager.isVerified(validPhone.normalizedPhoneNumber, OtpPurpose.REGISTRATION),
+                emailVerified = otpVerifiedTarget.equals(normalizedEmail, ignoreCase = true) &&
+                    otpManager.isVerified(normalizedEmail, OtpPurpose.REGISTRATION),
                 verifiedResponder = isVerified,
                 responderAvailability = true,
                 pushToken = existingPushToken,
@@ -1067,8 +1078,7 @@ class FirebaseAuthManager(
      */
     suspend fun requestForgotPasswordOtp(
         emailOrPhone: String,
-        channel: OtpChannel,
-        activity: Activity? = null
+        channel: OtpChannel
     ): Result<OtpDispatchResult> {
         val query = emailOrPhone.trim()
         if (query.isEmpty()) {
@@ -1083,22 +1093,16 @@ class FirebaseAuthManager(
         }
 
         val account = userRecord.second
-        val normalizedQuery = if (query.contains("@")) {
-            val emailValidation = EmailValidator.validate(query)
-            if (emailValidation is EmailValidationResult.Failure) {
-                return Result.failure(IllegalArgumentException(emailValidation.errorMessage))
-            }
-            (emailValidation as EmailValidationResult.Success).normalizedEmail
-        } else {
-            query
+        val targetDestination = when (channel) {
+            OtpChannel.EMAIL -> account.email.ifBlank { query }
+            OtpChannel.SMS, OtpChannel.WHATSAPP -> account.normalizedPhoneNumber.ifBlank { account.mobileNumber }.ifBlank { query }
         }
 
         return otpManager.sendOtp(
-            target = normalizedQuery,
+            target = targetDestination,
             channel = channel,
             purpose = OtpPurpose.FORGOT_PASSWORD,
-            displayName = account.displayName,
-            activity = activity
+            displayName = account.displayName
         )
     }
 
@@ -1110,13 +1114,15 @@ class FirebaseAuthManager(
         code: String
     ): Result<Boolean> {
         val query = emailOrPhone.trim()
-        val normalizedQuery = if (query.contains("@")) {
-            EmailValidator.normalize(query) ?: query
+        val userRecord = getFromUserRegistry(query)
+        val target = if (userRecord != null) {
+            val acc = userRecord.second
+            if (query.contains("@")) acc.email.ifBlank { query } else acc.normalizedPhoneNumber.ifBlank { acc.mobileNumber }.ifBlank { query }
         } else {
             query
         }
         return otpManager.verifyOtp(
-            target = normalizedQuery,
+            target = target,
             code = code,
             purpose = OtpPurpose.FORGOT_PASSWORD
         )
@@ -1129,7 +1135,8 @@ class FirebaseAuthManager(
     suspend fun resetPasswordWithOtp(
         emailOrPhone: String,
         otpCode: String,
-        newPassword: String
+        newPassword: String,
+        otpVerifiedTarget: String? = null
     ): Result<String> {
         val query = emailOrPhone.trim()
         val trimmedPass = newPassword.trim()
@@ -1146,14 +1153,11 @@ class FirebaseAuthManager(
 
         val account = userRecord.second
         val email = account.email
-        val normalizedQuery = if (query.contains("@")) {
-            EmailValidator.normalize(query) ?: query
-        } else {
-            query
-        }
+        val target = otpVerifiedTarget?.trim()?.takeIf { it.isNotEmpty() }
+            ?: if (query.contains("@")) account.email.ifBlank { query } else account.normalizedPhoneNumber.ifBlank { account.mobileNumber }.ifBlank { query }
 
-        if (!otpManager.isVerified(normalizedQuery, OtpPurpose.FORGOT_PASSWORD)) {
-            val verifyCheck = otpManager.verifyOtp(normalizedQuery, otpCode, OtpPurpose.FORGOT_PASSWORD)
+        if (!otpManager.isVerified(target, OtpPurpose.FORGOT_PASSWORD)) {
+            val verifyCheck = otpManager.verifyOtp(target, otpCode, OtpPurpose.FORGOT_PASSWORD)
             if (verifyCheck.isFailure) {
                 return Result.failure(verifyCheck.exceptionOrNull() ?: Exception("Invalid verification code."))
             }
@@ -1163,7 +1167,7 @@ class FirebaseAuthManager(
         saveToUserRegistry(email, trimmedPass, account)
 
         // Consume the OTP verification session
-        otpManager.consumeVerification(normalizedQuery, OtpPurpose.FORGOT_PASSWORD)
+        otpManager.consumeVerification(target, OtpPurpose.FORGOT_PASSWORD)
 
         // Attempt Firebase Auth password update or email reset link if supported
         auth?.let { fa ->

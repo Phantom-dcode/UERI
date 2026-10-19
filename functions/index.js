@@ -287,6 +287,27 @@ function hashTarget(target) {
   return crypto.createHash("sha256").update(target.trim().toLowerCase()).digest("hex");
 }
 
+async function readOtpChallenge(otpDocRef) {
+  try {
+    return await otpDocRef.get();
+  } catch (err) {
+    const errorCode = err && err.code;
+    if (errorCode === 5 || errorCode === "5" || errorCode === "NOT_FOUND") {
+      console.error("[UERI-AUTH] Firestore default database is not initialized for OTP storage.");
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Cloud Firestore is not initialized for this Firebase project. Create the default Firestore database before using email verification."
+      );
+    }
+
+    console.error("[UERI-AUTH] Could not access Firestore for OTP storage:", { code: errorCode });
+    throw new functions.https.HttpsError(
+      "unavailable",
+      "OTP storage is temporarily unavailable. No email verification request was completed."
+    );
+  }
+}
+
 /**
  * RFC 5321 / 5322 compliant email syntax validator for Cloud Functions backend.
  */
@@ -345,7 +366,7 @@ function validateEmail(rawEmail) {
  * 5. Callable Cloud Function: sendEmailOtp
  * - Validates email syntax strictly
  * - Enforces 60-second cooldown rate limit
- * - Checks configured email delivery provider (SMTP / Resend / SendGrid)
+ * - Checks configured SMTP email delivery
  * - Generates cryptographically secure 6-digit OTP
  * - Dispatches email through configured provider
  * - Hashes OTP with salt and stores in private Firestore otpVerifications only after delivery succeeds
@@ -357,10 +378,14 @@ exports.sendEmailOtp = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("invalid-argument", validation.error);
   }
   const email = validation.normalizedEmail;
+  const purpose = data && data.purpose;
+  if (!["REGISTRATION", "FORGOT_PASSWORD"].includes(purpose)) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid verification purpose.");
+  }
 
-  const targetId = hashTarget(email);
-  const otpDocRef = db.collection("otpVerifications").document(targetId);
-  const docSnap = await otpDocRef.get();
+  const targetId = hashTarget(`${purpose}:${email}`);
+  const otpDocRef = db.collection("otpVerifications").doc(targetId);
+  const docSnap = await readOtpChallenge(otpDocRef);
   const now = Date.now();
 
   // Rate limit: 60-second cooldown per target
@@ -390,8 +415,9 @@ exports.sendEmailOtp = functions.https.onCall(async (data, context) => {
   const salt = crypto.randomBytes(16).toString("hex");
   const codeHash = crypto.createHash("sha256").update(code + salt).digest("hex");
 
+  let acceptedByProvider = false;
   try {
-    await transporter.sendMail({
+    const sendResult = await transporter.sendMail({
       from: process.env.SMTP_FROM || `"UERI Security" <no-reply@ueri-emergency.org>`,
       to: email,
       subject: "Your UERI Verification Code",
@@ -405,27 +431,51 @@ exports.sendEmailOtp = functions.https.onCall(async (data, context) => {
         <p style="font-size:12px;color:#64748b;">This code expires in 10 minutes. Do not share this code with anyone.</p>
       </div>`,
     });
-    console.log(`[UERI-AUTH] Real email OTP dispatched to provider.`);
+    acceptedByProvider = Array.isArray(sendResult.accepted) &&
+      sendResult.accepted.some((recipient) => String(recipient).toLowerCase() === email.toLowerCase());
+    if (!acceptedByProvider) {
+      console.error("[UERI-AUTH] SMTP provider did not accept the verification recipient.");
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "The email provider did not accept the verification request."
+      );
+    }
   } catch (err) {
-    console.error(`[UERI-AUTH] Failed to send email via SMTP provider:`, err);
+    if (err instanceof functions.https.HttpsError) throw err;
+    console.error("[UERI-AUTH] Failed to send email via SMTP provider:", {
+      code: err && err.code,
+      responseCode: err && err.responseCode,
+      command: err && err.command,
+    });
     throw new functions.https.HttpsError("internal", "Failed to deliver verification email. Please try again later.");
   }
 
   // Record active verification challenge in Firestore only upon successful dispatch
-  await otpDocRef.set({
-    targetHash: targetId,
-    codeHash: codeHash,
-    salt: salt,
-    createdAt: now,
-    lastSentAt: now,
-    expiresAt: now + 10 * 60 * 1000, // 10 minutes
-    attemptsRemaining: 3,
-    isVerified: false,
-  });
+  try {
+    await otpDocRef.set({
+      targetHash: targetId,
+      purpose,
+      codeHash: codeHash,
+      salt: salt,
+      createdAt: now,
+      lastSentAt: now,
+      expiresAt: now + 10 * 60 * 1000, // 10 minutes
+      attemptsRemaining: 3,
+      isVerified: false,
+    });
+  } catch (err) {
+    console.error("[UERI-AUTH] SMTP accepted the message but OTP state could not be stored.", {
+      code: err && err.code,
+    });
+    throw new functions.https.HttpsError(
+      "unavailable",
+      "The email provider accepted the request, but verification could not be confirmed. Delivery status is unknown."
+    );
+  }
 
   return {
-    success: true,
-    message: "If this email can receive verification, a verification code has been sent.",
+    accepted: true,
+    deliveryStatus: "unknown",
   };
 });
 
@@ -441,21 +491,28 @@ exports.verifyEmailOtp = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("invalid-argument", "Invalid or expired verification code. Please try again.");
   }
   const email = validation.normalizedEmail;
+  const purpose = data && data.purpose;
+  if (!["REGISTRATION", "FORGOT_PASSWORD"].includes(purpose)) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid or expired verification code. Please try again.");
+  }
   const code = ((data && data.code) || "").trim();
 
   if (!code || code.length !== 6 || !/^\d{6}$/.test(code)) {
     throw new functions.https.HttpsError("invalid-argument", "Invalid or expired verification code. Please try again.");
   }
 
-  const targetId = hashTarget(email);
-  const otpDocRef = db.collection("otpVerifications").document(targetId);
-  const docSnap = await otpDocRef.get();
+  const targetId = hashTarget(`${purpose}:${email}`);
+  const otpDocRef = db.collection("otpVerifications").doc(targetId);
+  const docSnap = await readOtpChallenge(otpDocRef);
 
   if (!docSnap.exists) {
     throw new functions.https.HttpsError("invalid-argument", "Invalid or expired verification code. Please try again.");
   }
 
   const record = docSnap.data();
+  if (record.purpose !== purpose) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid or expired verification code. Please try again.");
+  }
   const now = Date.now();
 
   if (now > record.expiresAt) {
