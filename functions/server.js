@@ -213,6 +213,7 @@ app.post('/api/send-email-otp', async (req, res) => {
     });
   } catch (error) {
     console.error('Send OTP error:', error.message);
+    console.error('Error cause:', error.cause);
 
     return res.status(500).json({
       error: 'Could not send verification email. Check backend configuration.'
